@@ -1,0 +1,31 @@
+# Mail-to-Todo agent configuration. Copy to ~/.mail-agent/config.toml and edit.
+
+# Lower bound — agent never looks at messages received before this date.
+# Used (a) on first run when state.db is empty, and (b) any time you manually
+# reset by deleting BOTH Mail Triage.md AND state.db.
+start_date = "2026-05-03"
+
+# Obsidian vault to write the queue file into.
+# Personal: "/Users/martin/Dropbox (Personal)/Obsidian - Personal"
+# Work:     "/Users/martin/Partners HealthCare Dropbox/Martin Aryee/Obsidian - Work"
+vault_path = "/Users/martin/Dropbox (Personal)/Obsidian - Personal"
+
+# Path *within* the vault for the review queue. Created on first write.
+queue_file = "Inbox/Mail Triage.md"
+
+# Local Ollama model used for classification.
+ollama_model = "gemma4:e4b"
+
+# launchd schedule (informational; install.sh writes this into the plist).
+poll_interval_minutes = 5
+
+# Backpressure cap. Each run classifies at most this many messages; any
+# overflow stays unprocessed and is picked up by the next run. Tune by
+# watching cap_hit / backlog_remaining in runs.ndjson.
+max_messages_per_run = 50
+
+# Truncate each message body to this many bytes before sending to the LLM.
+content_truncate_bytes = 4096
+
+# Logging level for agent.log. One of DEBUG|INFO|WARN|ERROR.
+log_level = "INFO"

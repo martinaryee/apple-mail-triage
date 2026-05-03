@@ -1,0 +1,11 @@
+[project]
+name = "mail-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=8",
+    "requests>=2.33.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

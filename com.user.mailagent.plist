@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.mailagent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>/Users/martin/projects/mail-agent</string>
+        <string>python</string>
+        <string>/Users/martin/projects/mail-agent/agent.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/martin/projects/mail-agent</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/martin/.mail-agent/logs/agent.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/martin/.mail-agent/logs/agent.err.log</string>
+</dict>
+</plist>
