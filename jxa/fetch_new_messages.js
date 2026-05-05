@@ -133,16 +133,14 @@ function run(argv) {
       inboxName = 'INBOX';
     }
 
-    // Strategy: bulk-fetch all dates in one round trip per account, then do
-    // index math in JS. Calling `.at(i).dateReceived()` round-trips per i,
+    // Strategy: bulk-fetch all dates in one round trip per account, then
+    // filter in JS. Calling `.at(i).dateReceived()` round-trips per message,
     // which is minutes on Gmail's 130k+ inbox; bulk-fetch finishes in seconds.
     //
-    //   1. inbox.messages.dateReceived() -> array of Dates (newest-first).
-    //   2. In JS: find boundary = first index where date < sinceDate.
-    //   3. Indices [boundary - perAccountCap, boundary) are this account's
-    //      oldest-since-since candidates. Capture (account, idx, date) so
-    //      the global sort can pick the truly-oldest M across all accounts
-    //      without per-message round trips for messages we'll discard.
+    //   1. inbox.messages.dateReceived() -> array of Dates (order not assumed).
+    //   2. In JS: collect every index where date >= sinceDate.
+    //   3. Global sort picks the truly-oldest M across all accounts before
+    //      paying the per-message properties() cost for messages we'll emit.
     var totalMessages;
     try {
       totalMessages = inbox.messages.length;
@@ -160,26 +158,20 @@ function run(argv) {
       continue;
     }
 
-    // Find boundary in JS — linear from index 0 since the assumption
-    // (newest-first) is what we're verifying anyway. This is O(boundary),
-    // fast as long as the user's mailbox isn't *entirely* within the window.
-    var boundary = 0;
-    while (boundary < allDates.length && allDates[boundary] >= sinceDate) {
-      boundary++;
-    }
-
-    // Per-account cap: take the OLDEST perAccountCap candidates within the
-    // window, so a slow account can't starve fast ones in the global cap.
-    var perAccountCap = maxMessages * 4;
-    var startIdx = Math.max(0, boundary - perAccountCap);
-    for (var idx = boundary - 1; idx >= startIdx; idx--) {
-      results.push({
-        idx: idx,
-        inbox: inbox,
-        account: accountName,
-        mailbox: inboxName,
-        dateReceived: allDates[idx],
-      });
+    // Filter in JS: collect every index whose date is >= sinceDate.
+    // We intentionally do NOT assume newest-first ordering — out-of-order
+    // messages (wrong sender clock, messages moved/re-delivered into inbox)
+    // would cause a boundary-scan to stop early and silently skip valid mail.
+    for (var idx = 0; idx < allDates.length; idx++) {
+      if (allDates[idx] >= sinceDate) {
+        results.push({
+          idx: idx,
+          inbox: inbox,
+          account: accountName,
+          mailbox: inboxName,
+          dateReceived: allDates[idx],
+        });
+      }
     }
   }
 
