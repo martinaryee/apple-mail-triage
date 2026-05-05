@@ -15,6 +15,7 @@ import logging
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -27,7 +28,14 @@ from triage_queue import append_block, existing_message_ids
 DEFAULT_CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
 DEFAULT_DB_PATH = Path.home() / ".mail-agent" / "state.db"
 DEFAULT_LOG_DIR = Path.home() / ".mail-agent" / "logs"
-JXA_SCRIPT = Path(__file__).resolve().parent / "jxa" / "fetch_new_messages.js"
+JXA_SCRIPT     = Path(__file__).resolve().parent / "jxa" / "fetch_new_messages.js"
+JXA_SET_FLAGS  = Path(__file__).resolve().parent / "jxa" / "set_flags.js"
+
+_FLAG_GRAY   = 6  # processed, no action needed (grey — works on Gmail + Exchange)
+_FLAG_GREEN  = 3  # low urgency actionable
+_FLAG_ORANGE = 2  # medium urgency actionable
+_FLAG_RED    = 1  # high urgency actionable
+_URGENCY_TO_FLAG = {"high": _FLAG_RED, "medium": _FLAG_ORANGE, "low": _FLAG_GREEN}
 
 
 def load_config(path: Path) -> dict:
@@ -62,10 +70,19 @@ def compute_since(db_path: Path, start_date: str) -> str:
     return high if high > start_date else start_date
 
 
-def fetch_messages(
+def stream_messages(
     since_iso: str, max_n: int, truncate_bytes: int
-) -> tuple[list[dict], list[str]]:
-    """Run the JXA fetcher and parse NDJSON. Returns (messages, errors)."""
+):
+    """Yield (msg_dict, None) or (None, error_str) as JXA emits each line.
+
+    Uses Popen so the caller sees each message the moment JXA writes it,
+    rather than waiting for the entire fetch to complete. JXA emits
+    oldest-first and caps at max_n, so no re-sorting is needed.
+
+    Note on stderr: we read it after stdout is exhausted. JXA writes only
+    short warning lines to stderr, so the pipe buffer will not fill and
+    deadlock.
+    """
     cmd = [
         "/usr/bin/osascript",
         "-l", "JavaScript",
@@ -74,39 +91,64 @@ def fetch_messages(
         "--max", str(max_n),
         "--truncate-bytes", str(truncate_bytes),
     ]
-    errors: list[str] = []
-    msgs: list[dict] = []
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-    except subprocess.TimeoutExpired:
-        return msgs, [f"jxa timeout after 300s (since={since_iso})"]
     except FileNotFoundError as e:
-        return msgs, [f"osascript not found: {e}"]
+        yield None, f"osascript not found: {e}"
+        return
 
-    if proc.returncode != 0:
-        errors.append(
-            f"jxa exit {proc.returncode}: {proc.stderr.strip()[:500]}"
-        )
-        return msgs, errors
+    assert proc.stdout is not None
+    assert proc.stderr is not None
 
-    # Split only on '\n' — NOT splitlines(), which also breaks on U+2028/U+2029
-    # that JXA's JSON.stringify leaves unescaped (legal JSON, but ambiguous as
-    # NDJSON line separators). Each emit ends with '\n' from writeStdout.
-    for line in proc.stdout.split("\n"):
-        line = line.strip("\r")
+    # Read stdout line-by-line — strip only \r to preserve the splitlines()
+    # avoidance documented in HANDOFF.md (U+2028/U+2029 in JSON strings).
+    for raw_line in proc.stdout:
+        line = raw_line.strip("\r\n")
         if not line:
             continue
         try:
-            msgs.append(json.loads(line))
+            yield json.loads(line), None
         except json.JSONDecodeError as e:
-            errors.append(f"bad jxa ndjson: {e}: {line[:200]}")
+            yield None, f"bad jxa ndjson: {e}: {line[:200]}"
 
-    if proc.stderr.strip():
-        for ln in proc.stderr.strip().splitlines():
-            errors.append(f"jxa stderr: {ln}")
-    return msgs, errors
+    proc.stdout.close()
+    stderr_text = proc.stderr.read()
+    proc.stderr.close()
+    proc.wait()
+
+    if proc.returncode != 0:
+        yield None, f"jxa exit {proc.returncode}: {stderr_text.strip()[:500]}"
+        return
+    if stderr_text.strip():
+        for ln in stderr_text.strip().splitlines():
+            yield None, f"jxa stderr: {ln}"
+
+
+def _apply_flags(assignments: list[dict], log: logging.Logger) -> None:
+    """Set Apple Mail flag colors for a batch of messages via JXA."""
+    if not assignments:
+        return
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as f:
+        json.dump(assignments, f)
+        tmp_path = f.name
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-l", "JavaScript", str(JXA_SET_FLAGS),
+             "--input", tmp_path],
+            capture_output=True, text=True, timeout=600,
+        )
+        if proc.stderr.strip():
+            log.info("set_flags: %s", proc.stderr.strip())
+        if proc.returncode != 0:
+            log.warning("set_flags exited %d", proc.returncode)
+    except subprocess.TimeoutExpired:
+        log.warning("set_flags timed out")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def reset_state(queue_path: Path, db_path: Path) -> None:
@@ -133,6 +175,8 @@ def main() -> int:
     ap.add_argument("--reset", action="store_true",
                     help="delete the queue file and state.db (with confirmation)")
     ap.add_argument("--since", help="override since (ISO8601) for testing")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="print one-line status for every message to stderr")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -167,29 +211,53 @@ def main() -> int:
 
     stats = RunStats(model=model, dry_run=args.dry_run, max_messages_per_run=cap)
 
-    # Ask JXA for cap+1 so we can detect overflow.
-    msgs, fetch_errors = fetch_messages(since, cap + 1, truncate)
-    for e in fetch_errors:
-        stats.record_error("fetch", None, e)
-        log.warning("fetch: %s", e)
-
-    cap_hit = len(msgs) > cap
-    backlog = len(msgs) - cap if cap_hit else 0
-    if cap_hit:
-        msgs.sort(key=lambda m: m.get("dateReceived") or "")
-        msgs = msgs[:cap]
-    else:
-        msgs.sort(key=lambda m: m.get("dateReceived") or "")
-    stats.set_cap_hit(cap_hit, backlog)
-
     # Safety belt: existing queue ids prevent duplicate writes if state.db
     # is fresh but queue.md was kept (or vice versa).
     existing_ids = existing_message_ids(queue_path) if queue_path.exists() else set()
 
+    def vprint(n: int, tag: str, detail: str) -> None:
+        if args.verbose:
+            print(f"[{n}] {tag:30s} {detail}", file=sys.stderr, flush=True)
+
+    if args.verbose:
+        print(f"Fetching messages since {since} …", file=sys.stderr, flush=True)
+
+    # Ask JXA for cap+1 so we can detect overflow. JXA emits oldest-first and
+    # applies the cap internally, so no re-sort is needed here.
+    n = 0
+    cap_hit = False
+    backlog = 0
+    flag_assignments: list[dict] = []
+
+    def _flag(msg: dict, flag_index: int) -> None:
+        mail_id = msg.get("id")
+        if mail_id and msg.get("account") and msg.get("mailbox"):
+            flag_assignments.append({
+                "account": msg["account"],
+                "mailbox": msg["mailbox"],
+                "id": mail_id,
+                "flagIndex": flag_index,
+            })
+
     with State(db_path) as state:
-        for msg in msgs:
+        for msg, err in stream_messages(since, cap + 1, truncate):
+            if err:
+                stats.record_error("fetch", None, err)
+                log.warning("fetch: %s", err)
+                continue
+
+            # If JXA sent cap+1 messages the queue has a backlog; count extras
+            # but don't process them.
+            if n >= cap:
+                cap_hit = True
+                backlog += 1
+                continue
+
+            n += 1
             account = msg.get("account") or "unknown"
             mid = msg.get("messageId") or ""
+            subject = msg.get("subject") or "(no subject)"
+            sender = msg.get("sender") or ""
             stats.record_fetched(account)
 
             if not mid:
@@ -197,19 +265,24 @@ def main() -> int:
                 # dedupe across runs, so skip and log.
                 stats.record_error("fetch", None, "missing messageId; skipping")
                 log.warning("missing Message-Id from %s; skipping", account)
+                vprint(n, "SKIP no-message-id", f"{sender} | {subject}")
                 continue
 
             if state.is_processed(mid):
                 stats.record_deduped_already_seen()
+                vprint(n, "SKIP already-seen", f"{sender} | {subject}")
                 continue
 
             keep, drop_reason = filter_message(msg)
             if not keep:
                 stats.record_heuristic_dropped(drop_reason or "unknown")
+                vprint(n, f"DROP {drop_reason}", f"{sender} | {subject}")
+                _flag(msg, _FLAG_GRAY)
                 if not args.dry_run:
                     state.mark_processed(mid, account, msg.get("dateReceived", ""), False)
                 continue
 
+            vprint(n, "CLASSIFYING...", f"{sender} | {subject}")
             try:
                 result = classify_mod.classify(
                     msg, model=model, content_truncate_bytes=truncate,
@@ -217,6 +290,7 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 stats.record_error("classify", mid, str(e))
                 log.exception("classify crashed for %s", mid)
+                vprint(n, "ERROR classify-crash", f"{sender} | {subject}")
                 continue
 
             if result.get("error"):
@@ -235,8 +309,10 @@ def main() -> int:
             )
 
             if actionable:
+                _flag(msg, _URGENCY_TO_FLAG.get(urgency, _FLAG_GREEN))
                 if mid in existing_ids:
                     log.debug("queue dedupe (file): %s", mid)
+                    vprint(n, f"ACTIONABLE [{urgency}] dup", f"{sender} | {subject}")
                 else:
                     entry = {
                         "title": result.get("title") or "(no title)",
@@ -250,16 +326,33 @@ def main() -> int:
                     if not args.dry_run:
                         append_block(queue_path, entry)
                         existing_ids.add(mid)
+                    vprint(n, f"ACTIONABLE [{urgency}]", f"{sender} | {subject}")
                     log.info(
                         "%s [%s] %s | %s",
                         "QUEUED" if not args.dry_run else "WOULD-QUEUE",
                         urgency, account, entry["title"],
                     )
+            else:
+                _flag(msg, _FLAG_GRAY)
+                vprint(n, "not actionable", f"{sender} | {subject}")
 
             if not args.dry_run:
                 state.mark_processed(
                     mid, account, msg.get("dateReceived", ""), actionable
                 )
+
+    stats.set_cap_hit(cap_hit, backlog)
+
+    if not args.dry_run:
+        _apply_flags(flag_assignments, log)
+    elif flag_assignments and args.verbose:
+        print(f"[dry-run] would flag {len(flag_assignments)} messages", file=sys.stderr, flush=True)
+
+    if args.verbose:
+        print(
+            f"Done: {n} message(s) processed{f', {backlog} in backlog' if cap_hit else ''}",
+            file=sys.stderr, flush=True,
+        )
 
     if args.dry_run:
         log.info("[dry-run] not writing runs.ndjson")

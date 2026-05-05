@@ -43,15 +43,33 @@ launchd (every 5 min)
   classify.py    (Ollama gemma4:e4b, think=false)
         |
    actionable?
-      yes |                no |
-          v                   v
-  triage_queue.py         state.py (mark seen)
-  (append to             (never re-classify)
+      yes |                        no |
+          v                           v
+  triage_queue.py               state.py (mark seen)
+  (append to                   (never re-classify)
    Mail Triage.md)
         |
-        v
+        +---------------------------+
+                    |
+                    v
+          set_flags.js (JXA) ---> Apple Mail
+          (color-flag each message by outcome)
+
   stats.py  -->  ~/.mail-agent/logs/runs.ndjson
 ```
+
+After every run, each processed message is color-flagged in Apple Mail:
+
+| Color | Flag index | Meaning |
+|-------|-----------|---------|
+| 🔴 Red | 1 | Actionable — high urgency |
+| 🟠 Orange | 2 | Actionable — medium urgency |
+| 🟢 Green | 3 | Actionable — low urgency |
+| ⚫ Grey | 6 | Seen, no action needed (dropped by prefilter or not actionable) |
+
+Flags are set via `jxa/set_flags.js` at the end of each batch. The flagIndex
+values were determined empirically — they differ from Apple's documentation.
+Both Gmail (IMAP) and Exchange accounts support indices 1–6.
 
 ---
 
@@ -104,7 +122,7 @@ You can also trigger the prompt on demand by running the agent manually once:
 
 ```bash
 cd /Users/martin/projects/mail-agent
-uv run agent.py --dry-run
+uv run python agent.py --dry-run
 ```
 
 ---
@@ -127,15 +145,84 @@ Config file: `~/.mail-agent/config.toml`. A fully-commented example is at
 
 ---
 
-## Tuning the prompt
+## Prompt refinement
 
 The classifier's system prompt lives at
-[`prompts/classify_system.md`](prompts/classify_system.md). Edit and save —
-the next agent run picks it up; no code change needed. Keep it short; the
-prompt file is appended to the system message verbatim.
+[`prompts/classify_system.md`](prompts/classify_system.md). It is loaded
+fresh on every run — edit and save, and the next run picks it up with no
+code change.
 
-If you want to A/B prompts later, dated copies in `prompts/archive/` and a
-symlink swap is the simplest path.
+### Iterating without re-fetching from Mail
+
+Fetching messages from Apple Mail has a per-message IPC cost (~7s each).
+To avoid paying it on every prompt iteration, first dump a small fixed
+dataset of today's classifier-bound messages, then replay that dataset
+as many times as you like.
+
+**Step 1 — Dump candidates** (run once per dataset, requires Mail):
+
+```bash
+uv run python dump_candidates.py
+```
+
+This fetches the last 48 hours of mail, applies the prefilter, and saves
+every message that would reach the classifier to
+`~/.mail-agent/candidates.json`. Dropped messages (newsletters, no-reply,
+etc.) are shown but not saved. A drop-reason summary is printed at the end.
+
+To fetch a specific window instead:
+
+```bash
+uv run python dump_candidates.py --since "2026-05-04T00:00:00"
+```
+
+**Step 2 — Classify and review** (fast, no Mail access):
+
+```bash
+uv run python run_classifier.py
+```
+
+Output for each message:
+
+```
+[1/5] alice@example.com | Can you review the budget?
+  ACTIONABLE [high] — Review budget proposal by Friday
+  Why: Sender explicitly asks for a decision before the deadline
+  1823ms  (245 prompt + 48 eval tokens)
+
+[2/5] announcements@dfci.harvard.edu | Town Hall — May 15
+  not actionable
+  Why: Broadcast announcement, no personal action required
+  1541ms  (198 prompt + 31 eval tokens)
+
+────────────────────────────────────────────────
+Actionable: 1/5
+Total time: 8.4s  (1682ms avg)
+```
+
+**Step 3 — Edit and repeat:**
+
+```
+edit prompts/classify_system.md
+uv run python run_classifier.py
+```
+
+The prompt is reloaded on every `run_classifier.py` invocation. The
+candidate dataset stays fixed until you re-run `dump_candidates.py`.
+
+### Prompt strategy notes
+
+- Keep the prompt short. The model sees it on every message; a 200-token
+  system prompt is fine, a 2000-token one adds latency and rarely helps.
+- Be concrete about what "actionable" means for *your* inbox. The default
+  prompt errs toward false negatives (misses) rather than false positives
+  (noise in the queue); adjust the threshold to your preference.
+- Urgency is the hardest field to get right. If urgency calibration is
+  off, add examples to the prompt rather than changing the definition.
+- `run_classifier.py --truncate-bytes N` lets you experiment with how
+  much message body the model sees. Candidates are stored at 16 KB;
+  production uses 4 KB. Larger context rarely changes outcomes for short
+  personal emails but can matter for dense threads.
 
 ---
 
@@ -168,6 +255,43 @@ Each actionable message gets a block like:
 
 ---
 
+## Running manually / testing
+
+You can invoke the agent directly at any time — useful for testing, backfilling
+a time window, or watching what it does before enabling the launchd job.
+
+```bash
+cd /Users/martin/projects/mail-agent
+
+# Dry-run with verbose output from a specific time (no writes to queue or state.db)
+uv run python agent.py --dry-run --verbose --since "2026-05-04T17:00:00"
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Classify messages but write nothing — no queue updates, no state.db entries, no runs.ndjson record. Safe to run repeatedly. |
+| `--verbose` / `-v` | Print one status line per message to stderr as it is processed, so you can watch progress in real time. Without this flag only queued items are logged. |
+| `--since <ISO8601>` | Override the start of the fetch window. Bare timestamps (no `Z` or offset) are interpreted as local time. |
+
+**Verbose output looks like:**
+
+```
+Fetching messages since 2026-05-04T17:00:00 …
+[1] DROP list_unsubscribe        newsletter@example.com | Weekly digest
+[2] DROP no_reply_sender         noreply@github.com | PR merged
+[3] CLASSIFYING...               alice@example.com | Can you review this?
+[3] ACTIONABLE [high]            alice@example.com | Can you review this?
+[4] SKIP already-seen            bob@example.com | Re: meeting notes
+Done: 4 message(s) processed
+```
+
+Tags: `DROP <reason>`, `SKIP already-seen`, `SKIP no-message-id`, `CLASSIFYING...`,
+`ACTIONABLE [urgency]`, `not actionable`, `ERROR classify-crash`.
+
+---
+
 ## Reset / starting over
 
 The queue file and `state.db` are independent. Deleting only the queue file
@@ -185,7 +309,7 @@ Or use the convenience flag, which prompts for confirmation before deleting:
 
 ```bash
 cd /Users/martin/projects/mail-agent
-uv run agent.py --reset
+uv run python agent.py --reset
 ```
 
 After a reset, the agent starts fresh from `start_date` on its next run.
@@ -216,7 +340,7 @@ the prompt:
 
 ```bash
 cd /Users/martin/projects/mail-agent
-uv run agent.py --dry-run
+uv run python agent.py --dry-run
 ```
 
 ### "Ollama errors" / classifier not responding
