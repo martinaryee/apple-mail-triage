@@ -267,14 +267,14 @@ def main() -> int:
             })
 
     with State(db_path) as state:
+        # Ask for cap+1 so we can detect overflow without fetching the full backlog.
         for msg, err in stream_messages(since, cap + 1, truncate):
             if err:
                 stats.record_error("fetch", None, err)
                 log.warning("fetch: %s", err)
                 continue
 
-            # If JXA sent cap+1 messages the queue has a backlog; count extras
-            # but don't process them.
+            # If JXA sent cap+1 messages there is a backlog of unknown size.
             if n >= cap:
                 cap_hit = True
                 backlog += 1
@@ -377,7 +377,7 @@ def main() -> int:
 
     if args.verbose:
         print(
-            f"Done: {n} message(s) processed{f', {backlog} in backlog' if cap_hit else ''}",
+            f"Done: {n} message(s) processed{', backlog remains' if cap_hit else ''}",
             file=sys.stderr, flush=True,
         )
 
