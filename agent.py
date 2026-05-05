@@ -10,6 +10,8 @@ runs.ndjson.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import io
 import json
 import logging
 import sqlite3
@@ -28,6 +30,7 @@ from triage_queue import append_block, existing_message_ids
 DEFAULT_CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
 DEFAULT_DB_PATH = Path.home() / ".mail-agent" / "state.db"
 DEFAULT_LOG_DIR = Path.home() / ".mail-agent" / "logs"
+DEFAULT_LOCK_PATH = Path.home() / ".mail-agent" / "agent.lock"
 JXA_SCRIPT     = Path(__file__).resolve().parent / "jxa" / "fetch_new_messages.js"
 JXA_SET_FLAGS  = Path(__file__).resolve().parent / "jxa" / "set_flags.js"
 
@@ -36,6 +39,23 @@ _FLAG_GREEN  = 3  # low urgency actionable
 _FLAG_ORANGE = 2  # medium urgency actionable
 _FLAG_RED    = 1  # high urgency actionable
 _URGENCY_TO_FLAG = {"high": _FLAG_RED, "medium": _FLAG_ORANGE, "low": _FLAG_GREEN}
+
+
+def acquire_run_lock(lock_path: Path) -> "io.TextIOWrapper | None":
+    """Try to acquire an exclusive lock. Returns the open file handle on success,
+    None if another run is already active.
+
+    Uses fcntl.flock so the lock is released automatically by the OS if this
+    process dies — no stale lock files possible.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except OSError:
+        fh.close()
+        return None
 
 
 def load_config(path: Path) -> dict:
@@ -197,6 +217,13 @@ def main() -> int:
         handlers=[logging.FileHandler(log_path), logging.StreamHandler(sys.stderr)],
     )
     log = logging.getLogger("agent")
+
+    lock_fh: io.TextIOWrapper | None = None
+    if not args.dry_run:
+        lock_fh = acquire_run_lock(DEFAULT_LOCK_PATH)
+        if lock_fh is None:
+            log.info("another run is active — skipping")
+            return 0
 
     model = cfg["ollama_model"]
     cap = int(cfg["max_messages_per_run"])
