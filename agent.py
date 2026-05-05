@@ -358,8 +358,7 @@ def main() -> int:
                     log.info(
                         "%s [%s] %s | %s | %s",
                         "QUEUED" if not args.dry_run else "WOULD-QUEUE",
-                        urgency, account, entry["title"],
-                        date_received,
+                        urgency, date_received, account, entry["title"],
                     )
             else:
                 _flag(msg, _FLAG_GRAY)
