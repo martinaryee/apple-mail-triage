@@ -354,10 +354,12 @@ def main() -> int:
                         append_block(queue_path, entry)
                         existing_ids.add(mid)
                     vprint(n, f"ACTIONABLE [{urgency}]", f"{sender} | {subject}")
+                    date_received = msg.get("dateReceived", "")
                     log.info(
-                        "%s [%s] %s | %s",
+                        "%s [%s] %s | %s | %s",
                         "QUEUED" if not args.dry_run else "WOULD-QUEUE",
                         urgency, account, entry["title"],
+                        date_received,
                     )
             else:
                 _flag(msg, _FLAG_GRAY)
