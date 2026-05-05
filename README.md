@@ -62,9 +62,9 @@ After every run, each processed message is color-flagged in Apple Mail:
 
 | Color | Flag index | Meaning |
 |-------|-----------|---------|
-| 🔴 Red | 1 | Actionable — high urgency |
-| 🟠 Orange | 2 | Actionable — medium urgency |
-| 🟢 Green | 3 | Actionable — low urgency |
+| 🔴 Red | 0 | Actionable — high urgency |
+| 🟠 Orange | 1 | Actionable — medium urgency |
+| 🟡 Yellow | 2 | Actionable — low urgency |
 | ⚫ Grey | 6 | Seen, no action needed (dropped by prefilter or not actionable) |
 
 Flags are set via `jxa/set_flags.js` at the end of each batch. The flagIndex
