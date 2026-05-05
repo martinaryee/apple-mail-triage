@@ -10,8 +10,8 @@
  * CLI:
  *   --input <path>   REQUIRED. Path to a JSON file containing an array of:
  *                    { account, mailbox, id, flagIndex }
- *                    where flagIndex is 0 (clear) or 1–6:
- *                    1=red  2=orange  3=green  4=blue  5=purple  6=grey
+ *                    where flagIndex is 0–6 (or -1 to clear):
+ *                    0=red  1=orange  2=yellow  3=green  4=blue  5=purple  6=grey
  *
  * Exit 0 on success (partial failures are logged to stderr but not fatal).
  * Exit 1 on argument or I/O errors.

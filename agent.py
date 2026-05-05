@@ -35,10 +35,10 @@ JXA_SCRIPT     = Path(__file__).resolve().parent / "jxa" / "fetch_new_messages.j
 JXA_SET_FLAGS  = Path(__file__).resolve().parent / "jxa" / "set_flags.js"
 
 _FLAG_GRAY   = 6  # processed, no action needed (grey — works on Gmail + Exchange)
-_FLAG_GREEN  = 3  # low urgency actionable
-_FLAG_ORANGE = 2  # medium urgency actionable
-_FLAG_RED    = 1  # high urgency actionable
-_URGENCY_TO_FLAG = {"high": _FLAG_RED, "medium": _FLAG_ORANGE, "low": _FLAG_GREEN}
+_FLAG_YELLOW = 2  # low urgency actionable
+_FLAG_ORANGE = 1  # medium urgency actionable
+_FLAG_RED    = 0  # high urgency actionable
+_URGENCY_TO_FLAG = {"high": _FLAG_RED, "medium": _FLAG_ORANGE, "low": _FLAG_YELLOW}
 
 
 def acquire_run_lock(lock_path: Path) -> "io.TextIOWrapper | None":
