@@ -336,7 +336,7 @@ def main() -> int:
             )
 
             if actionable:
-                _flag(msg, _URGENCY_TO_FLAG.get(urgency, _FLAG_GREEN))
+                _flag(msg, _URGENCY_TO_FLAG.get(urgency, _FLAG_YELLOW))
                 if mid in existing_ids:
                     log.debug("queue dedupe (file): %s", mid)
                     vprint(n, f"ACTIONABLE [{urgency}] dup", f"{sender} | {subject}")
