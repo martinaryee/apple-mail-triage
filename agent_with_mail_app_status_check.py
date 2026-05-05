@@ -43,14 +43,11 @@ def is_mail_app_active() -> bool:
     if result.returncode != 0:
         return False
     
+    # Check if Mail is frontmost (focused)
     script = '''
     tell application "System Events"
         tell process "Mail"
-            try
-                return value of attribute "AXMain" of window 1
-            on error
-                return false
-            end try
+            get frontmost
         end tell
     end tell
     '''
@@ -61,6 +58,7 @@ def is_mail_app_active() -> bool:
         text=True,
     )
     if result.returncode != 0:
+        # If we can't check, assume not active (conservative)
         return False
     
     return result.stdout.strip().lower() == "true"
@@ -70,6 +68,8 @@ def acquire_lock(lock_path: Path) -> "io.TextIOWrapper | None":
     """Try to acquire an exclusive lock. Returns file handle on success."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     
+    log = logging.getLogger("lock")
+    
     # Check for stale/empty lock file and remove it
     if lock_path.exists():
         try:
@@ -77,16 +77,22 @@ def acquire_lock(lock_path: Path) -> "io.TextIOWrapper | None":
                 content = f.read().strip()
             if not content:
                 # Empty lock file - stale, remove it
+                log.info("Found empty lock file - removing stale lock")
                 lock_path.unlink(missing_ok=True)
             else:
                 # Try to read PID and check if process exists
                 pid = int(content)
-                import os
                 os.kill(pid, 0)  # Raises OSError if process doesn't exist
                 # Process exists, lock is valid
+                log.debug(f"Lock held by PID {pid}, waiting...")
                 return None
-        except (ValueError, OSError):
-            # PID is invalid or process doesn't exist - stale lock
+        except ValueError:
+            # PID is invalid - stale lock
+            log.info(f"Found invalid PID in lock file - removing stale lock")
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            # Process doesn't exist - stale lock
+            log.info(f"Lock held by nonexistent PID - removing stale lock")
             lock_path.unlink(missing_ok=True)
     
     try:
@@ -94,11 +100,9 @@ def acquire_lock(lock_path: Path) -> "io.TextIOWrapper | None":
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fh.write(str(os.getpid()))
         fh.flush()
-        log = logging.getLogger("lock")
         log.debug(f"Lock acquired successfully (PID {os.getpid()})")
         return fh
     except OSError as e:
-        log = logging.getLogger("lock")
         log.debug(f"Lock acquisition failed: {e}")
         try:
             fh.close()
