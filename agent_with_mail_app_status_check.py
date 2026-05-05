@@ -69,15 +69,45 @@ def is_mail_app_active() -> bool:
 def acquire_lock(lock_path: Path) -> "io.TextIOWrapper | None":
     """Try to acquire an exclusive lock. Returns file handle on success."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Check for stale/empty lock file and remove it
+    if lock_path.exists():
+        try:
+            with lock_path.open("r") as f:
+                content = f.read().strip()
+            if not content:
+                # Empty lock file - stale, remove it
+                lock_path.unlink(missing_ok=True)
+            else:
+                # Try to read PID and check if process exists
+                pid = int(content)
+                import os
+                os.kill(pid, 0)  # Raises OSError if process doesn't exist
+                # Process exists, lock is valid
+                return None
+        except (ValueError, OSError):
+            # PID is invalid or process doesn't exist - stale lock
+            lock_path.unlink(missing_ok=True)
+    
     try:
         fh = lock_path.open("w")
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fh.write(str(os.getpid()))
         fh.flush()
+        log = logging.getLogger("lock")
+        log.debug(f"Lock acquired successfully (PID {os.getpid()})")
         return fh
-    except OSError:
-        fh.close()
-        lock_path.unlink(missing_ok=True)
+    except OSError as e:
+        log = logging.getLogger("lock")
+        log.debug(f"Lock acquisition failed: {e}")
+        try:
+            fh.close()
+        except:
+            pass
+        try:
+            lock_path.unlink(missing_ok=True)
+        except:
+            pass
         return None
 
 
