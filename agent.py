@@ -258,7 +258,7 @@ def main() -> int:
 
     def _flag(msg: dict, flag_index: int) -> None:
         mail_id = msg.get("id")
-        if mail_id and msg.get("account") and msg.get("mailbox"):
+        if mail_id is not None and msg.get("account") and msg.get("mailbox"):
             flag_assignments.append({
                 "account": msg["account"],
                 "mailbox": msg["mailbox"],
