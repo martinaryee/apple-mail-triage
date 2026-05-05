@@ -11,17 +11,44 @@ the code as it stands today (post-implementation), see
 war stories from getting this performant on Apple Mail, see
 [HANDOFF.md](HANDOFF.md).
 
+## Mail app status-aware scheduling
+
+To prevent delays in Apple Mail's UI while the agent is running, the agent
+wrapper checks whether Mail is **active** (running and focused) before each
+scheduled run:
+
+- **Mail active and focused**: Wait up to 30 minutes, polling every 30 seconds
+  until Mail becomes idle. If timeout is reached, proceed anyway.
+- **Mail idle**: Run immediately.
+- **Another run in progress**: Skip silently (single-instance lock).
+
+This avoids blocking Mail's AppleScript bridge when you're actively reading or
+composing messages.
+
 ---
 
 ## What it does
 
-The agent wakes up every 5 minutes, fetches messages that arrived since the
-last run, drops obvious noise (newsletters, auto-replies, mailing lists) with
-a fast header heuristic, and sends the survivors to a local Ollama model for
-classification. Emails that imply a personal action — a reply, a decision, an
-RSVP, a deadline — are appended as `- [ ]` checkboxes to `Mail Triage.md` in
-your Obsidian vault. Everything else is silently recorded as seen and never
-shown again.
+---
+
+## What it does
+
+The agent wrapper woke up every 5 minutes, but now includes mail app status
+checking to prevent slowdowns:
+
+- When Mail is active (running + focused), the wrapper waits up to 30 minutes,
+  polling every 30 seconds, before proceeding
+- When Mail is idle, the wrapper allows immediate execution
+- Only one run is allowed at a time via lock file
+
+The actual triage logic (fetch, prefilter, classify, queue) remains the same.
+After the status check passes, the agent wakes up, fetches messages that
+arrived since the last run, drops obvious noise (newsletters, auto-replies,
+mailing lists) with a fast header heuristic, and sends the survivors to a
+local Ollama model for classification. Emails that imply a personal action — a
+reply, a decision, an RSVP, a deadline — are appended as `- [ ]` checkboxes to
+`Mail Triage.md` in your Obsidian vault. Everything else is silently recorded
+as seen and never shown again.
 
 ---
 
@@ -142,6 +169,8 @@ Config file: `~/.mail-agent/config.toml`. A fully-commented example is at
 | `max_messages_per_run` | `50` | Cap on how many messages are classified in a single run. Excess is carried to the next run. **Raise this if you see frequent `cap_hit` in `runs.ndjson`; lower it if runs are slow.** |
 | `content_truncate_bytes` | `4096` | Message body is trimmed to this length before sending to the LLM. 4 KB is enough signal; larger values slow inference. |
 | `log_level` | `"INFO"` | `DEBUG`, `INFO`, `WARN`, or `ERROR`. |
+| `mail_app_status_check.poll_delay_seconds` | `30` | Seconds between checks when Mail is active/focused. |
+| `mail_app_status_check.max_wait_minutes` | `30` | Maximum minutes to wait for Mail to become idle before forcing the run. |
 
 ---
 
@@ -420,6 +449,9 @@ tail -50 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
 
 # How many messages were actionable today?
 grep "$(date -u +%Y-%m-%d)" ~/.mail-agent/logs/runs.ndjson | jq '.counts.actionable' | awk '{s+=$1}END{print s}'
+
+# Mail app status delays (last 20 runs)
+tail -20 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.mail_app_status != null) | [.started_at, .mail_app_status.skipped_mail_active, .mail_app_status.waited_seconds] | @tsv'
 ```
 
 For heavier analysis, load the file into pandas:

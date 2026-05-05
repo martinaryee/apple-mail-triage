@@ -3,7 +3,8 @@ set -euo pipefail
 
 # ============================================================
 #  Mail-Agent Install Script
-#  Installs the launchd job that runs agent.py every 5 minutes.
+#  Installs the launchd job that runs the status-aware agent
+#  wrapper every 5 minutes.
 # ============================================================
 
 LABEL="com.user.mailagent"
@@ -109,6 +110,8 @@ echo "[5/8] Config file found: ${CONFIG_FILE}"
 mkdir -p "${HOME}/Library/LaunchAgents"
 cp "${PLIST_SRC}" "${PLIST_DST}"
 echo "[6/8] Plist installed to ${PLIST_DST}"
+echo "      Wrapper script: agent_with_mail_app_status_check.py"
+echo "      Mail app status checks will delay runs when Mail is active/focused"
 
 plutil -lint "${PLIST_DST}"
 echo "      plutil -lint: OK"
@@ -156,6 +159,9 @@ echo "    tail -f ~/.mail-agent/logs/agent.log"
 echo ""
 echo "  Review structured run stats:"
 echo "    cat ~/.mail-agent/logs/runs.ndjson"
+echo ""
+echo "  Check mail app status delays in runs:"
+echo "    jq -r '.mail_app_status' ~/.mail-agent/logs/runs.ndjson | head -20"
 echo ""
 echo "  Check launchd status:"
 echo "    launchctl print gui/${UID}/${LABEL}"

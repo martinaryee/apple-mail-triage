@@ -12,7 +12,7 @@
         <string>--project</string>
         <string>/Users/martin/projects/mail-agent</string>
         <string>python</string>
-        <string>/Users/martin/projects/mail-agent/agent.py</string>
+        <string>/Users/martin/projects/mail-agent/agent_with_mail_app_status_check.py</string>
     </array>
 
     <key>WorkingDirectory</key>

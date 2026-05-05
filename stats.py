@@ -78,6 +78,11 @@ class RunStats:
         self._cap_hit: bool = False
         self._backlog_remaining: int = 0
 
+        # Mail app status (schema version 2)
+        self._skipped_mail_active: bool = False
+        self._waited_seconds: int = 0
+        self._forced_run: bool = False
+
     # ------------------------------------------------------------------
     # Counter methods
     # ------------------------------------------------------------------
@@ -131,6 +136,14 @@ class RunStats:
     def set_cap_hit(self, hit: bool, backlog_remaining: int) -> None:
         self._cap_hit = hit
         self._backlog_remaining = backlog_remaining
+
+    def set_mail_app_status(
+        self, skipped: bool, waited_seconds: int, forced_run: bool
+    ) -> None:
+        """Record mail app status metrics (schema version 2)."""
+        self._skipped_mail_active = skipped
+        self._waited_seconds = waited_seconds
+        self._forced_run = forced_run
 
     # ------------------------------------------------------------------
     # write()
@@ -213,6 +226,11 @@ class RunStats:
             },
             "per_account": dict(self._per_account),
             "errors": list(self._errors),
+            "mail_app_status": {
+                "skipped_mail_active": self._skipped_mail_active,
+                "waited_seconds": self._waited_seconds,
+                "forced_run": self._forced_run,
+            } if self.schema_version >= 2 else None,
         }
 
         path.parent.mkdir(parents=True, exist_ok=True)
