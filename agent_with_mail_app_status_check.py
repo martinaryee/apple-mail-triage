@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """Wrapper that checks mail app status before running the agent.
 
-Only 1 run is allowed at a time. The wrapper owns the lock file
-(~/.mail-agent/agent.lock) and prevents overlapping runs.
-
+Only 1 run is allowed at a time via the agent's lock file.
 When mail app is active (running + focused), the wrapper polls every
 poll_delay_seconds until mail becomes idle, up to max_wait_minutes.
 On timeout, it forces proceeds anyway.
 """
 
 import argparse
-import fcntl
 import io
 import logging
 import os
@@ -158,9 +155,7 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Mail-to-todo agent with mail app status checking"
-    )
+    ap = argparse.ArgumentParser(description="Wrapper for mail-agent that checks mail app status.")
     ap.add_argument(
         "--config",
         type=Path,
@@ -209,62 +204,62 @@ def main() -> int:
     )
     log = logging.getLogger("mail_app_checker")
     
-    lock_fh = acquire_lock(DEFAULT_LOCK_PATH)
-    if lock_fh is None:
-        log.debug("Another run is active — skipping")
-        return 0
+    # Check mail status
+    waited_seconds = 0
+    forced_run = False
+    max_wait_seconds = max_wait * 60
+    while is_mail_app_active():
+        if waited_seconds >= max_wait_seconds:
+            log.info(f"Mail app still active after {max_wait}min - forcing run")
+            forced_run = True
+            break
+        log.info(f"Mail app active, waiting {poll_delay}s...")
+        time.sleep(poll_delay)
+        waited_seconds += poll_delay
     
-    try:
-        if is_mail_app_active():
-            forced_run, waited_seconds = wait_for_mail_idle(
-                poll_delay_seconds=poll_delay,
-                max_wait_minutes=max_wait,
-                log=log,
-            )
-            
-            runs_path = DEFAULT_LOG_DIR / "runs.ndjson"
-            model = cfg["ollama_model"]
-            cap = int(cfg["max_messages_per_run"])
-            
-            stats = RunStats(
-                model=model,
-                dry_run=args.dry_run,
-                max_messages_per_run=cap,
-                schema_version=2,
-            )
-            stats.set_mail_app_status(skipped=True, waited_seconds=waited_seconds, forced_run=forced_run)
-            stats.write(runs_path)
-            
-            log.info(f"Skipped run due to mail app being active. Waited {waited_seconds}s")
-            
-            if forced_run:
-                log.info("Force proceeding after timeout")
-            else:
-                log.info("Proceeding with agent after mail became idle")
+    if waited_seconds > 0:
+        runs_path = DEFAULT_LOG_DIR / "runs.ndjson"
+        model = cfg["ollama_model"]
+        cap = int(cfg["max_messages_per_run"])
+        
+        stats = RunStats(
+            model=model,
+            dry_run=args.dry_run,
+            max_messages_per_run=cap,
+            schema_version=2,
+        )
+        stats.set_mail_app_status(skipped=True, waited_seconds=waited_seconds, forced_run=forced_run)
+        stats.write(runs_path)
+        
+        log.info(f"Skipped run due to mail app being active. Waited {waited_seconds}s")
+        
+        if forced_run:
+            log.info("Force proceeding after timeout")
         else:
-            log.info("Mail app not active. Proceeding with agent")
-        
-        cmd = [
-            sys.executable,
-            str(AGENT_SCRIPT),
-            "--config", str(args.config),
-        ]
-        if args.dry_run:
-            cmd.append("--dry-run")
-        if args.verbose:
-            cmd.append("--verbose")
-        if args.since:
-            cmd.append("--since")
-            cmd.append(args.since)
-        if args.reset:
-            cmd.append("--reset")
-        
-        result = subprocess.run(cmd)
-        return result.returncode
+            log.info("Proceeding with agent after mail became idle")
+    else:
+        log.info("Mail app not active. Proceeding with agent")
     
-    finally:
-        if lock_fh:
-            lock_fh.close()
+    # Set sys.argv for agent.py argument parsing
+    sys.argv = ["agent.py"]
+    if args.config:
+        sys.argv.extend(["--config", str(args.config)])
+    if args.dry_run:
+        sys.argv.append("--dry-run")
+    if args.verbose:
+        sys.argv.append("--verbose")
+    if args.since:
+        sys.argv.extend(["--since", args.since])
+    if args.reset:
+        sys.argv.append("--reset")
+    
+    # Import and run agent directly (not as subprocess)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent", AGENT_SCRIPT)
+    agent_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_module)
+    
+    return agent_module.main()
 
 
 if __name__ == "__main__":
