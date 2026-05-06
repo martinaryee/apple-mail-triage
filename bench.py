@@ -148,7 +148,7 @@ def main() -> int:
         print()
 
     if not args.skip_disk:
-        print("=== Disk fetch (fetcher.stream_messages_since via apple-mail-mcp) ===")
+        print("=== Disk fetch (fetcher.stream_messages_since — Envelope Index + .emlx) ===")
         try:
             t, msgs, errs = _fetch_disk(args.since, args.max, truncate)
             disk_msgs = msgs
