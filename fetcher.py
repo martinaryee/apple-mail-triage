@@ -1,24 +1,23 @@
 """
-fetcher.py — replaces fetch_new_messages.js (JXA) with direct disk reads.
+fetcher.py — disk-direct Apple Mail fetcher; replaces JXA fetch.
 
-Strategy: read .emlx files via imdinu/apple-mail-mcp's tested parser, and
-query its on-disk index for the SINCE-timestamp filter. Apple Mail itself
-is never touched on the fetch path — eliminating the unresponsiveness that
-the old JXA approach caused.
+Reads Apple Mail's own Envelope Index SQLite database for the date filter,
+then parses the corresponding .emlx file for body, headers, and flags. No
+AppleScript runs on the fetch path — the unresponsiveness the old JXA
+approach caused is eliminated.
 
-The agent still uses JXA for ONE thing: setting flag colors after
-classification (see jxa/set_flags.js). Account UUIDs from disk are mapped
-to friendly names via a one-shot list_accounts.js call so the flag-setter
-can do `mail.accounts.byName(...)` unchanged.
+Apple Mail itself maintains the Envelope Index continuously, so there is
+no separate index for us to build, sync, or watch.
 
-First run: requires `apple-mail-mcp index` to build the FTS5 index from
-~/Library/Mail/V*/. Terminal needs Full Disk Access. Subsequent runs do
-an incremental sync (typically <1s).
+Setup: the user that runs this needs Full Disk Access (System Settings →
+Privacy & Security → Full Disk Access). Without it ~/Library/Mail is
+unreadable.
 """
 
 from __future__ import annotations
 
 import email
+import email.message
 import json
 import logging
 import plistlib
@@ -35,27 +34,62 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Plist footer flag bits — see Mail.app reverse-engineering docs.
+# Apple's Core Data epoch is 2001-01-01 00:00:00 UTC; offset from Unix epoch.
+# Apple Mail stores date_received in the Envelope Index in this format.
+_CORE_DATA_EPOCH = 978307200
+
+# Plist footer flag bits in .emlx files (reverse-engineered from Mail.app).
 _FLAG_BIT_READ = 1 << 0
 _FLAG_BIT_JUNK = 1 << 11
 
 _JXA_LIST_ACCOUNTS = Path(__file__).resolve().parent / "jxa" / "list_accounts.js"
 
-# Mailboxes treated as "inbox". Apple Mail's IMAP accounts use "INBOX",
-# local accounts use "Inbox"; we match case-insensitively.
-_INBOX_NAMES = ("inbox",)
+
+# ── Mail directory & Envelope Index discovery ────────────────────────────────
 
 
-# ── Account UUID → friendly name ─────────────────────────────────────────────
+def find_mail_dir() -> Path:
+    """Return the highest-numbered ~/Library/Mail/V<N>/ directory.
+
+    Apple Mail bumps V<N> on schema-breaking changes (V10 since macOS
+    Catalina). Picking the highest keeps this working on V11+ in future
+    macOS releases without code changes.
+    """
+    base = Path.home() / "Library" / "Mail"
+    if not base.exists():
+        raise FileNotFoundError(f"Apple Mail directory not found: {base}")
+    candidates = []
+    try:
+        for entry in base.iterdir():
+            if entry.is_dir() and entry.name.startswith("V") and entry.name[1:].isdigit():
+                candidates.append((int(entry.name[1:]), entry))
+    except PermissionError as e:
+        raise PermissionError(
+            f"Cannot read {base} — grant Full Disk Access in "
+            "System Settings → Privacy & Security → Full Disk Access"
+        ) from e
+    if not candidates:
+        raise FileNotFoundError(f"No V<N> mail directory under {base}")
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def find_envelope_index(mail_dir: Path) -> Path:
+    p = mail_dir.parent / "MailData" / "Envelope Index"
+    if not p.exists():
+        raise FileNotFoundError(f"Envelope Index not found at {p}")
+    return p
+
+
+# ── Account UUID → friendly name (one-shot JXA call) ────────────────────────
 
 
 def load_account_map() -> dict[str, str]:
     """One-shot JXA call returning {uuid: friendly_name}.
 
-    The JXA round trip costs ~0.5s and only reads metadata, so it does not
-    block Mail.app meaningfully. Returns {} on failure; callers fall back
-    to the UUID, which still flows through the rest of the pipeline (the
-    flag-setter would just fail for those accounts — logged but non-fatal).
+    JXA round-trip is short (~0.5s) and reads only metadata. Returns {} on
+    failure — callers fall back to UUID-as-name and the flag-setter path
+    will log a non-fatal warning for affected messages.
     """
     if not _JXA_LIST_ACCOUNTS.exists():
         return {}
@@ -67,99 +101,208 @@ def load_account_map() -> dict[str, str]:
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.warning("list_accounts JXA failed: %s", e)
         return {}
-
     if proc.returncode != 0:
-        logger.warning("list_accounts JXA exit %d: %s", proc.returncode, proc.stderr.strip()[:200])
+        logger.warning("list_accounts JXA exit %d: %s",
+                       proc.returncode, proc.stderr.strip()[:200])
         return {}
     try:
         data = json.loads(proc.stdout.strip() or "[]")
     except json.JSONDecodeError as e:
         logger.warning("list_accounts JXA bad JSON: %s", e)
         return {}
-    return {entry["id"]: entry["name"] for entry in data
-            if isinstance(entry, dict) and "id" in entry and "name" in entry}
+    return {
+        e["id"]: e["name"]
+        for e in data
+        if isinstance(e, dict) and "id" in e and "name" in e
+    }
 
 
-# ── .emlx auxiliary parsing (junk flag + raw headers) ────────────────────────
-#
-# imdinu's parse_emlx returns body, sender, subject, read, flagged, etc. but
-# does not expose:
-#   • the junk-mail flag (plist bit 11)
-#   • the raw RFC-822 header block (needed by prefilter.py to inspect
-#     Auto-Submitted, Precedence, List-Unsubscribe)
-# We re-read the file once to extract these. The cost is negligible because
-# emlx files are small (median ~10 KB) and we process at most ~200/run.
+# ── Time conversion ──────────────────────────────────────────────────────────
 
 
-def _emlx_extras(emlx_path: Path) -> dict:
-    """Return {'headers': str, 'junk': bool} for an .emlx file.
+def _iso_to_core_data(iso: str) -> float:
+    """Convert ISO-8601 to Core Data seconds (since 2001-01-01 UTC)."""
+    s = iso.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp() - _CORE_DATA_EPOCH
 
-    On any read/parse error returns sensible defaults rather than raising —
-    a partially-parsed message is more useful than dropping it entirely.
+
+def _core_data_to_iso(ts: float | int | None) -> str:
+    if ts is None:
+        return ""
+    try:
+        unix_ts = float(ts) + _CORE_DATA_EPOCH
+        return datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
+# ── .emlx parser ─────────────────────────────────────────────────────────────
+
+
+def parse_emlx(path: Path, truncate_bytes: int) -> Optional[dict]:
+    r"""Parse a single .emlx file end-to-end.
+
+    Format:
+        <byte_count>\n
+        <RFC 822 message of exactly byte_count bytes>
+        <plist footer with Apple metadata (flags, etc.)>
+
+    Returns a dict with all fields the downstream pipeline needs, or None
+    on read/parse failure. Best-effort: a partial parse is more useful
+    than dropping the message entirely.
     """
     try:
-        raw = emlx_path.read_bytes()
+        raw = path.read_bytes()
     except OSError:
-        return {"headers": "", "junk": False}
+        return None
 
     nl = raw.find(b"\n")
     if nl < 0:
-        return {"headers": "", "junk": False}
+        return None
     try:
         byte_count = int(raw[:nl].strip())
     except ValueError:
-        return {"headers": "", "junk": False}
+        return None
 
     mime_start = nl + 1
     mime_end = mime_start + byte_count
     mime_bytes = raw[mime_start:mime_end]
     plist_bytes = raw[mime_end:]
 
-    # Extract the raw header block (everything before the first blank line).
+    msg = email.message_from_bytes(mime_bytes)
+
+    # Raw header block — prefilter.py inspects this for Auto-Submitted,
+    # Precedence, List-Unsubscribe.
     sep = mime_bytes.find(b"\r\n\r\n")
     if sep < 0:
         sep = mime_bytes.find(b"\n\n")
-    headers = mime_bytes[: sep if sep >= 0 else len(mime_bytes)].decode(
+    headers_text = mime_bytes[: sep if sep >= 0 else len(mime_bytes)].decode(
         "utf-8", errors="replace"
     )
 
-    junk = False
+    junk = read = False
     if plist_bytes.strip():
         try:
-            plist = plistlib.loads(plist_bytes)
-            flags = int(plist.get("flags", 0))
+            flags = int(plistlib.loads(plist_bytes).get("flags", 0))
+            read = bool(flags & _FLAG_BIT_READ)
             junk = bool(flags & _FLAG_BIT_JUNK)
         except Exception:
             pass
 
-    return {"headers": headers, "junk": junk}
+    subject = _decode_header(msg.get("Subject"))
+    sender = _decode_header(msg.get("From"))
+    reply_to = _decode_header(msg.get("Reply-To")) or None
+    message_id = (msg.get("Message-Id") or msg.get("Message-ID") or "").strip()
+
+    # Date received: prefer the Received header (delivery time), fall back
+    # to Date header (composition time). Matches Apple Mail's own display.
+    date_received = ""
+    rec = msg.get("Received")
+    if rec:
+        i = rec.rfind(";")
+        if i >= 0:
+            try:
+                date_received = parsedate_to_datetime(rec[i + 1:].strip()).isoformat()
+            except (ValueError, TypeError):
+                pass
+    if not date_received and msg.get("Date"):
+        try:
+            date_received = parsedate_to_datetime(msg["Date"]).isoformat()
+        except (ValueError, TypeError):
+            pass
+
+    content = _extract_body(msg)
+    if truncate_bytes > 0:
+        content = _truncate_to_bytes(content, truncate_bytes)
+
+    return {
+        "subject": subject,
+        "sender": sender,
+        "replyTo": reply_to,
+        "messageId": message_id,
+        "dateReceived": date_received,
+        "junk": junk,
+        "read": read,
+        "headers": headers_text,
+        "content": content,
+    }
 
 
-# ── Index management (delegated to apple-mail-mcp) ───────────────────────────
+def _decode_header(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except (UnicodeDecodeError, LookupError):
+        return value
 
 
-def _ensure_index_ready() -> "IndexManager":  # noqa: F821
-    """Return a synced IndexManager, building from disk if needed.
+def _extract_body(msg: email.message.Message) -> str:
+    """Plain-text body, preferring text/plain over text/html."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    cs = part.get_content_charset() or "utf-8"
+                    return payload.decode(cs, errors="replace")
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    cs = part.get_content_charset() or "utf-8"
+                    return _strip_html(payload.decode(cs, errors="replace"))
+        return ""
+    payload = msg.get_payload(decode=True)
+    if payload:
+        cs = msg.get_content_charset() or "utf-8"
+        text = payload.decode(cs, errors="replace")
+        if msg.get_content_type() == "text/html":
+            return _strip_html(text)
+        return text
+    return ""
 
-    Building from scratch on a 100k+ mailbox takes a few minutes; subsequent
-    syncs are incremental and finish in <1s. The user must have granted Full
-    Disk Access to the terminal/launchd binary that runs this.
+
+def _strip_html(html: str) -> str:
+    """Naive HTML strip — adequate for body text fed into an LLM."""
+    no_scripts = re.sub(
+        r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE
+    )
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", no_scripts)).strip()
+
+
+def _truncate_to_bytes(s: str, max_bytes: int) -> str:
+    enc = s.encode("utf-8")
+    if len(enc) <= max_bytes:
+        return s
+    # errors='ignore' drops a partial multibyte sequence at the cut point.
+    return enc[:max_bytes].decode("utf-8", errors="ignore") + "…"
+
+
+# ── .emlx path resolution ───────────────────────────────────────────────────
+
+
+def _emlx_path(mail_dir: Path, account_uuid: str, mailbox_name: str, msg_id: int) -> Optional[Path]:
+    """Find the .emlx file for a (account, mailbox, msg_id) tuple.
+
+    Apple Mail buckets messages by digit segments of the ID:
+        V*/<UUID>/<mailbox>.mbox/Data/<a>/<b>/Messages/<id>.emlx
+    The exact bucketing has shifted across macOS versions, so we glob the
+    bounded (10×10) bucket directories rather than computing them. The
+    glob hits ≤2 directories per ID, so cost is negligible.
     """
-    # Imported lazily so missing Full Disk Access produces a clean error
-    # at the call site rather than at module import time.
-    from apple_mail_mcp.index import IndexManager
-    from apple_mail_mcp.index.disk import find_mail_directory
-
-    manager = IndexManager.get_instance()
-
-    if not manager.has_index():
-        logger.info("Building apple-mail-mcp index from disk (first run)…")
-        mail_dir = find_mail_directory()
-        manager.build_from_disk(mail_dir)
-        logger.info("Index build complete.")
-    else:
-        manager.sync_updates()
-    return manager
+    mbox_dir = mail_dir / account_uuid / f"{mailbox_name}.mbox"
+    if not mbox_dir.is_dir():
+        return None
+    for ext in (".emlx", ".partial.emlx"):
+        for hit in mbox_dir.glob(f"Data/*/*/Messages/{msg_id}{ext}"):
+            return hit
+    return None
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -170,113 +313,107 @@ def stream_messages_since(
     max_messages: int,
     truncate_bytes: int,
 ) -> Iterator[tuple[Optional[dict], Optional[str]]]:
-    """Yield (msg_dict, None) or (None, error_str) — same contract as the
-    JXA-based stream_messages() it replaces.
-
-    Args:
-        since_iso: ISO 8601 timestamp; only messages with date_received >=
-            since are returned.
-        max_messages: Cap on emitted messages. The caller asks for cap+1 so
-            it can detect a backlog; we honour LIMIT exactly.
-        truncate_bytes: Truncate body content to this many UTF-8 bytes
-            before emitting.
+    """Yield (msg_dict, None) or (None, error_str). Drop-in replacement for
+    the JXA-backed stream_messages() — same dict shape, oldest-first sort,
+    same cap semantics.
     """
     try:
-        manager = _ensure_index_ready()
+        mail_dir = find_mail_dir()
+        envelope = find_envelope_index(mail_dir)
     except (FileNotFoundError, PermissionError) as e:
-        yield None, f"index init: {e}"
+        yield None, f"mail dir: {e}"
         return
-    except Exception as e:  # noqa: BLE001
-        yield None, f"index init failed: {e}"
+
+    try:
+        since_cd = _iso_to_core_data(since_iso)
+    except (ValueError, TypeError) as e:
+        yield None, f"bad since timestamp {since_iso!r}: {e}"
         return
 
     account_map = load_account_map()
 
-    # Normalise the since timestamp to imdinu's storage format (UTC isoformat
-    # with "+00:00") so the lexical comparison in SQL works correctly. JXA's
-    # toISOString() produces the "Z" form, which sorts BEFORE "+00:00" for
-    # the same instant — would skip valid messages without normalisation.
+    # Open the Envelope Index in immutable read-only mode so we don't
+    # interfere with Mail.app's own writers (or compete for the lock).
     try:
-        since_norm = _normalise_iso(since_iso)
-    except ValueError as e:
-        yield None, f"bad since timestamp {since_iso!r}: {e}"
+        conn = sqlite3.connect(f"file:{envelope}?mode=ro&immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        yield None, f"open envelope index: {e}"
         return
 
-    # Query the index DB directly. _get_conn() is technically private but
-    # the connection is the cleanest entry point; the schema is stable.
-    conn = manager._get_conn()
+    # Modern Mail.app stores subject/sender as foreign keys into separate
+    # tables; we LEFT JOIN them as fallbacks for cases where the .emlx is
+    # missing or unreadable. parse_emlx remains the primary source.
     try:
         cursor = conn.execute(
             """
-            SELECT message_id, account, mailbox, subject, sender,
-                   content, date_received, emlx_path
-            FROM emails
-            WHERE date_received >= ?
-              AND lower(mailbox) IN ({placeholders})
-              AND emlx_path IS NOT NULL
-            ORDER BY date_received ASC
+            SELECT
+                m.ROWID         AS msg_id,
+                m.date_received AS date_received,
+                s.subject       AS subject,
+                a.address       AS sender_addr,
+                a.comment       AS sender_name,
+                mb.url          AS mailbox_url
+            FROM messages m
+            LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
+            LEFT JOIN subjects  s  ON m.subject = s.ROWID
+            LEFT JOIN addresses a  ON m.sender  = a.ROWID
+            WHERE m.date_received >= ?
+              AND lower(mb.url) LIKE '%/inbox'
+            ORDER BY m.date_received ASC
             LIMIT ?
-            """.format(placeholders=",".join("?" * len(_INBOX_NAMES))),
-            (since_norm, *_INBOX_NAMES, max_messages),
+            """,
+            (since_cd, max_messages),
         )
         rows = cursor.fetchall()
     except sqlite3.Error as e:
-        yield None, f"index query: {e}"
+        conn.close()
+        yield None, f"envelope query: {e}"
         return
-
-    # Lazy import only inside this function so module-level import cost
-    # is bounded.
-    from apple_mail_mcp.index.disk import parse_emlx
+    finally:
+        conn.close()
 
     for row in rows:
-        emlx_path = Path(row["emlx_path"])
-        parsed = parse_emlx(emlx_path)
+        account_uuid, mailbox_name = _parse_mailbox_url(row["mailbox_url"])
+        emlx_path = _emlx_path(mail_dir, account_uuid, mailbox_name, row["msg_id"])
+        if emlx_path is None:
+            yield None, f"emlx not found for {account_uuid}/{mailbox_name}/{row['msg_id']}"
+            continue
+
+        parsed = parse_emlx(emlx_path, truncate_bytes)
         if parsed is None:
             yield None, f"emlx parse failed: {emlx_path}"
             continue
 
-        extras = _emlx_extras(emlx_path)
-        content = parsed.content or row["content"] or ""
-        if truncate_bytes > 0:
-            content = _truncate_to_bytes(content, truncate_bytes)
+        sender = parsed["sender"]
+        if not sender and row["sender_addr"]:
+            sender = (
+                f"{row['sender_name']} <{row['sender_addr']}>"
+                if row["sender_name"] else row["sender_addr"]
+            )
 
         yield {
-            "id": row["message_id"],
-            "account": account_map.get(row["account"], row["account"]),
-            "mailbox": row["mailbox"],
-            "subject": parsed.subject or row["subject"] or "",
-            "sender": parsed.sender or row["sender"] or "",
-            "replyTo": parsed.reply_to or None,
-            "messageId": parsed.message_id_header or "",
-            "dateReceived": parsed.date_received or row["date_received"] or "",
-            "junk": extras["junk"],
-            "read": bool(parsed.read) if parsed.read is not None else False,
-            "headers": extras["headers"],
-            "content": content,
+            "id": row["msg_id"],
+            "account": account_map.get(account_uuid, account_uuid),
+            "mailbox": mailbox_name,
+            "subject": parsed["subject"] or row["subject"] or "",
+            "sender": sender or "",
+            "replyTo": parsed["replyTo"],
+            "messageId": parsed["messageId"],
+            "dateReceived": parsed["dateReceived"] or _core_data_to_iso(row["date_received"]),
+            "junk": parsed["junk"],
+            "read": parsed["read"],
+            "headers": parsed["headers"],
+            "content": parsed["content"],
         }, None
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _normalise_iso(iso: str) -> str:
-    """Parse an ISO timestamp and re-emit in datetime.isoformat() form.
-
-    Handles the trailing 'Z' (UTC) shorthand. Always emits a tz-aware string
-    so lexical comparisons against imdinu's index entries are correct.
-    """
-    s = iso.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat()
-
-
-def _truncate_to_bytes(s: str, max_bytes: int) -> str:
-    enc = s.encode("utf-8")
-    if len(enc) <= max_bytes:
-        return s
-    # errors='ignore' drops the dangling multibyte sequence at the cut.
-    return enc[:max_bytes].decode("utf-8", errors="ignore") + "…"
+def _parse_mailbox_url(url: Optional[str]) -> tuple[str, str]:
+    """mailbox://<UUID>/<mailbox-path> → (uuid, mailbox-path)."""
+    if not url:
+        return "", ""
+    path = url.replace("mailbox://", "", 1)
+    parts = path.split("/", 1)
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return parts[0], ""
