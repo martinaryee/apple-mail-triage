@@ -22,6 +22,7 @@ import tomllib
 from pathlib import Path
 
 import classify as classify_mod
+import fetcher
 from prefilter import filter_message
 from state import State
 from stats import RunStats
@@ -31,7 +32,6 @@ DEFAULT_CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
 DEFAULT_DB_PATH = Path.home() / ".mail-agent" / "state.db"
 DEFAULT_LOG_DIR = Path.home() / ".mail-agent" / "logs"
 DEFAULT_LOCK_PATH = Path.home() / ".mail-agent" / "agent.lock"
-JXA_SCRIPT     = Path(__file__).resolve().parent / "jxa" / "fetch_new_messages.js"
 JXA_SET_FLAGS  = Path(__file__).resolve().parent / "jxa" / "set_flags.js"
 
 _FLAG_GRAY   = 6  # processed, no action needed (grey — works on Gmail + Exchange)
@@ -93,57 +93,15 @@ def compute_since(db_path: Path, start_date: str) -> str:
 def stream_messages(
     since_iso: str, max_n: int, truncate_bytes: int
 ):
-    """Yield (msg_dict, None) or (None, error_str) as JXA emits each line.
+    """Yield (msg_dict, None) or (None, error_str).
 
-    Uses Popen so the caller sees each message the moment JXA writes it,
-    rather than waiting for the entire fetch to complete. JXA emits
-    oldest-first and caps at max_n, so no re-sorting is needed.
-
-    Note on stderr: we read it after stdout is exhausted. JXA writes only
-    short warning lines to stderr, so the pipe buffer will not fill and
-    deadlock.
+    Delegates to fetcher.stream_messages_since(), which reads .emlx files
+    directly via apple-mail-mcp instead of driving Apple Mail through JXA.
+    The emit order (oldest-first, capped at max_n) and dict shape match
+    the previous JXA-backed implementation exactly so downstream code in
+    this module is unchanged.
     """
-    cmd = [
-        "/usr/bin/osascript",
-        "-l", "JavaScript",
-        str(JXA_SCRIPT),
-        "--since", since_iso,
-        "--max", str(max_n),
-        "--truncate-bytes", str(truncate_bytes),
-    ]
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-    except FileNotFoundError as e:
-        yield None, f"osascript not found: {e}"
-        return
-
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-
-    # Read stdout line-by-line — strip only \r to preserve the splitlines()
-    # avoidance documented in HANDOFF.md (U+2028/U+2029 in JSON strings).
-    for raw_line in proc.stdout:
-        line = raw_line.strip("\r\n")
-        if not line:
-            continue
-        try:
-            yield json.loads(line), None
-        except json.JSONDecodeError as e:
-            yield None, f"bad jxa ndjson: {e}: {line[:200]}"
-
-    proc.stdout.close()
-    stderr_text = proc.stderr.read()
-    proc.stderr.close()
-    proc.wait()
-
-    if proc.returncode != 0:
-        yield None, f"jxa exit {proc.returncode}: {stderr_text.strip()[:500]}"
-        return
-    if stderr_text.strip():
-        for ln in stderr_text.strip().splitlines():
-            yield None, f"jxa stderr: {ln}"
+    yield from fetcher.stream_messages_since(since_iso, max_n, truncate_bytes)
 
 
 def _apply_flags(assignments: list[dict], log: logging.Logger) -> None:
