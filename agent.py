@@ -3,8 +3,12 @@
 
 Pipeline per run: read new messages from Apple Mail's Envelope Index + .emlx
 files (fetcher.py, no AppleScript) -> prefilter heuristics -> classify with
-local Ollama -> append actionable items to a markdown review queue in Obsidian
+local Ollama -> optionally append actionable items to a markdown review queue
 -> record outcome in SQLite cache and runs.ndjson -> color-flag in Mail (JXA).
+
+Queue writing is optional (enable_triage_queue = false in config). When
+disabled the agent still classifies and color-flags every message; actionable
+items are orange/red in Mail instead of appearing in a queue file.
 """
 
 from __future__ import annotations
@@ -69,14 +73,14 @@ def load_config(path: Path) -> dict:
 
 
 def compute_since(db_path: Path, start_date: str) -> str:
-    """Earliest date the JXA fetcher should look back to.
+    """Earliest date the fetcher should look back to.
 
-    Returns max(start_date, max over accounts of MAX(date_received)). Using
-    the global max (not min-per-account) prevents the slowest account from
-    dragging `since` backward, which would re-fetch already-processed
-    messages every batch and stall progress. Trade-off: messages older than
-    the leading account's high_water in lagging accounts are skipped — the
-    proper fix is per-account since plumbed into JXA, deferred to v2.
+    Returns max(start_date, MAX(date_received) across all processed rows).
+    Using the global max (not min-per-account) prevents the slowest account
+    from dragging `since` backward, which would re-fetch already-processed
+    messages every batch. Trade-off: messages older than the leading
+    account's high-water in lagging accounts are skipped — per-account
+    watermarks are deferred to v2.
     """
     if not db_path.exists():
         return start_date
@@ -129,15 +133,16 @@ def _apply_flags(assignments: list[dict], log: logging.Logger) -> None:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-def reset_state(queue_path: Path, db_path: Path) -> None:
+def reset_state(queue_path: "Path | None", db_path: Path) -> None:
     print("This will delete:")
-    print(f"  {queue_path}  ({'exists' if queue_path.exists() else 'absent'})")
+    if queue_path is not None:
+        print(f"  {queue_path}  ({'exists' if queue_path.exists() else 'absent'})")
     print(f"  {db_path}  ({'exists' if db_path.exists() else 'absent'})")
     ans = input("Type 'yes' to confirm: ").strip()
     if ans != "yes":
         print("Aborted.")
         return
-    if queue_path.exists():
+    if queue_path is not None and queue_path.exists():
         queue_path.unlink()
         print(f"Deleted {queue_path}")
     if db_path.exists():
@@ -158,7 +163,13 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    queue_path = Path(cfg["vault_path"]) / cfg["queue_file"]
+    enable_queue = bool(cfg.get("enable_triage_queue", True))
+    if enable_queue:
+        if "vault_path" not in cfg:
+            sys.exit("Config error: enable_triage_queue is true but vault_path is not set.")
+        queue_path: "Path | None" = Path(cfg["vault_path"]) / cfg.get("queue_file", "Inbox/Mail Triage.md")
+    else:
+        queue_path = None
     db_path = DEFAULT_DB_PATH
 
     if args.reset:
@@ -191,14 +202,19 @@ def main() -> int:
 
     log.info(
         "run start: model=%s since=%s cap=%d dry=%s queue=%s",
-        model, since, cap, args.dry_run, queue_path,
+        model, since, cap, args.dry_run,
+        queue_path if enable_queue else "disabled",
     )
 
     stats = RunStats(model=model, dry_run=args.dry_run, max_messages_per_run=cap)
 
     # Safety belt: existing queue ids prevent duplicate writes if state.db
     # is fresh but queue.md was kept (or vice versa).
-    existing_ids = existing_message_ids(queue_path) if queue_path.exists() else set()
+    existing_ids: set[str] = (
+        existing_message_ids(queue_path)
+        if enable_queue and queue_path is not None and queue_path.exists()
+        else set()
+    )
 
     def vprint(n: int, tag: str, detail: str) -> None:
         if args.verbose:
@@ -207,8 +223,7 @@ def main() -> int:
     if args.verbose:
         print(f"Fetching messages since {since} …", file=sys.stderr, flush=True)
 
-    # Ask JXA for cap+1 so we can detect overflow. JXA emits oldest-first and
-    # applies the cap internally, so no re-sort is needed here.
+    # Fetch cap+1 so we can detect overflow without fetching the full backlog.
     n = 0
     cap_hit = False
     backlog = 0
@@ -295,28 +310,37 @@ def main() -> int:
 
             if actionable:
                 _flag(msg, _URGENCY_TO_FLAG.get(urgency, _FLAG_YELLOW))
-                if mid in existing_ids:
-                    log.debug("queue dedupe (file): %s", mid)
-                    vprint(n, f"ACTIONABLE [{urgency}] dup", f"{sender} | {subject}")
+                date_received = msg.get("dateReceived", "")
+                title = result.get("title") or "(no title)"
+                if enable_queue:
+                    if mid in existing_ids:
+                        log.debug("queue dedupe (file): %s", mid)
+                        vprint(n, f"ACTIONABLE [{urgency}] dup", f"{sender} | {subject}")
+                    else:
+                        entry = {
+                            "title": title,
+                            "messageId": mid,
+                            "urgency": urgency,
+                            "sender": msg.get("sender", ""),
+                            "dateReceived": date_received,
+                            "reason": result.get("reason", ""),
+                            "account": account,
+                        }
+                        if not args.dry_run:
+                            append_block(queue_path, entry)
+                            existing_ids.add(mid)
+                        vprint(n, f"ACTIONABLE [{urgency}]", f"{sender} | {subject}")
+                        log.info(
+                            "%s [%s] %s | %s | %s",
+                            "QUEUED" if not args.dry_run else "WOULD-QUEUE",
+                            urgency, date_received, account, title,
+                        )
                 else:
-                    entry = {
-                        "title": result.get("title") or "(no title)",
-                        "messageId": mid,
-                        "urgency": urgency,
-                        "sender": msg.get("sender", ""),
-                        "dateReceived": msg.get("dateReceived", ""),
-                        "reason": result.get("reason", ""),
-                        "account": account,
-                    }
-                    if not args.dry_run:
-                        append_block(queue_path, entry)
-                        existing_ids.add(mid)
+                    # Queue disabled — flagging only; log for visibility.
                     vprint(n, f"ACTIONABLE [{urgency}]", f"{sender} | {subject}")
-                    date_received = msg.get("dateReceived", "")
                     log.info(
-                        "%s [%s] %s | %s | %s",
-                        "QUEUED" if not args.dry_run else "WOULD-QUEUE",
-                        urgency, date_received, account, entry["title"],
+                        "ACTIONABLE [%s] %s | %s | %s",
+                        urgency, date_received, account, title,
                     )
             else:
                 _flag(msg, _FLAG_GRAY)

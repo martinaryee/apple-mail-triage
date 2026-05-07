@@ -155,10 +155,15 @@ Critical Ollama options sent in the request body:
 
 ### `triage_queue.append_block(path, entry)` and `existing_message_ids(path)`
 
-Append-only writer for `Mail Triage.md`. Each block embeds the RFC 822
+Append-only writer for `Mail Triage.md`. Only called when
+`enable_triage_queue = true` in config (default). Each block embeds the RFC 822
 Message-Id in an HTML comment (`<!-- mid:<id> urgency:<u> -->`), so the agent
 can dedupe against the file before writing. Uses `fcntl.LOCK_EX` for
 cross-process safety.
+
+When the queue is disabled, `vault_path` is not required and `append_block` is
+never called. Classification still runs (urgency is needed to pick the flag
+color); actionable items are only surfaced via Apple Mail color flags.
 
 ### `state.State` (SQLite cache)
 

@@ -1,9 +1,9 @@
-# Mail-to-Todo Agent
+# Mail Agent
 
-Triages new Apple Mail messages every 5 minutes using a local LLM, and queues
-actionable ones as checkboxes in a markdown file inside your Obsidian vault.
-Everything runs on-device — no email content, metadata, or message subjects
-ever leave your Mac.
+Triages new Apple Mail messages every 5 minutes using a local LLM. Actionable
+emails are color-flagged in Mail and, optionally, queued as checkboxes in a
+markdown file in your Obsidian vault. Everything runs on-device — no email
+content, metadata, or message subjects ever leave your Mac.
 
 For a tour of the code as it stands today, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -19,12 +19,14 @@ The agent wakes up every 5 minutes, checks whether Mail is the frontmost app
 2. Drops obvious noise (newsletters, auto-replies, mailing lists, junk) with a
    fast header heuristic — no LLM needed.
 3. Sends the survivors to a local Ollama model for classification.
-4. Appends actionable emails — ones that imply a reply, decision, RSVP, or
-   deadline — as `- [ ]` checkboxes in `Mail Triage.md` in your Obsidian vault.
-5. Color-flags every processed message in Apple Mail via a single JXA call.
+4. Color-flags every processed message in Apple Mail (orange/red = actionable,
+   grey = not actionable).
+5. Optionally appends actionable emails as `- [ ]` checkboxes to `Mail
+   Triage.md` in your Obsidian vault — set `enable_triage_queue = false` in
+   config to skip this step and use flagging only.
 
-Only one run is allowed at a time (lock file). Everything else is recorded as
-seen in `state.db` and never re-classified.
+Only one run is allowed at a time (lock file). Everything is recorded in
+`state.db` and never re-classified.
 
 ---
 
@@ -156,8 +158,9 @@ Config file: `~/.mail-agent/config.toml`. A fully-commented example is at
 | Key | Default | What it does |
 |-----|---------|--------------|
 | `start_date` | `"2026-05-03"` | Hard floor — the agent never looks at mail older than this date. **Tune this first if you want to backfill older mail.** |
-| `vault_path` | Personal Obsidian path | Absolute path to the root of your Obsidian vault (or any directory). **Must exist.** |
-| `queue_file` | `"Inbox/Mail Triage.md"` | Path *within* the vault for the review queue. Created on first write. |
+| `enable_triage_queue` | `true` | Write actionable items to a markdown queue file. Set to `false` for flagging-only mode — no Obsidian required. |
+| `vault_path` | — | Absolute path to your Obsidian vault root (or any directory). **Required when `enable_triage_queue = true`.** |
+| `queue_file` | `"Inbox/Mail Triage.md"` | Path *within* the vault for the review queue. Created on first write. Ignored when queue is disabled. |
 | `ollama_model` | `"gemma4:e4b"` | Model used for classification. Must be pulled locally (`ollama pull <model>`). |
 | `poll_interval_minutes` | `5` | Informational — reflects the `StartInterval` in the plist. Change in the plist, not just here. |
 | `max_messages_per_run` | `50` | Cap on messages classified per run. Excess is carried to the next run. |
@@ -226,13 +229,26 @@ uv run python run_classifier.py
 
 ## Daily use
 
-### Where action items appear
+### Flag colors in Apple Mail
+
+Regardless of queue settings, every processed message is color-flagged:
+
+| Color | Meaning |
+|-------|---------|
+| 🔴 Red | Actionable — high urgency |
+| 🟠 Orange | Actionable — medium urgency |
+| 🟡 Yellow | Actionable — low urgency |
+| ⚫ Grey | Seen, no action needed |
+
+### Where action items appear (queue enabled)
+
+When `enable_triage_queue = true`, each actionable message is also appended to:
 
 ```
 <vault_path>/Inbox/Mail Triage.md
 ```
 
-Each actionable message gets a block like:
+Each entry looks like:
 
 ```markdown
 - [ ] Reply to Nicole about cooking-club trial on May 7  <!-- mid:<id> urgency:medium -->
@@ -292,14 +308,16 @@ uv run python bench.py --since "2026-05-01T00:00:00" --max 100 --run-jxa
 
 ## Reset / starting over
 
-To redo triage from scratch, delete both the queue file and state:
+To redo triage from scratch, delete both the queue file (if using one) and
+state:
 
 ```bash
-rm "$VAULT_PATH/Inbox/Mail Triage.md"
+rm "$VAULT_PATH/Inbox/Mail Triage.md"   # skip if enable_triage_queue = false
 rm ~/.mail-agent/state.db
 ```
 
-Or use the convenience flag (prompts for confirmation):
+Or use the convenience flag (prompts for confirmation, skips queue file if
+queue is disabled):
 
 ```bash
 uv run python agent.py --reset
