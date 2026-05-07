@@ -6,49 +6,26 @@ Everything runs on-device — no email content, metadata, or message subjects
 ever leave your Mac.
 
 For the original design rationale, see [PLAN-1.md](PLAN-1.md). For a tour of
-the code as it stands today (post-implementation), see
-[ARCHITECTURE.md](ARCHITECTURE.md). For the handoff notes, open work, and the
-war stories from getting this performant on Apple Mail, see
-[HANDOFF.md](HANDOFF.md).
-
-## Mail app status-aware scheduling
-
-To prevent delays in Apple Mail's UI while the agent is running, the agent
-wrapper checks whether Mail is **active** (running and focused) before each
-scheduled run:
-
-- **Mail active and focused**: Wait up to 30 minutes, polling every 30 seconds
-  until Mail becomes idle. If timeout is reached, proceed anyway.
-- **Mail idle**: Run immediately.
-- **Another run in progress**: Skip silently (single-instance lock).
-
-This avoids blocking Mail's AppleScript bridge when you're actively reading or
-composing messages.
+the code as it stands today, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
 ## What it does
 
----
+The agent wakes up every 5 minutes, checks whether Mail is the frontmost app
+(and waits up to 30 minutes if so), then:
 
-## What it does
+1. Reads new messages directly from Apple Mail's SQLite Envelope Index and
+   `.emlx` files on disk — no AppleScript, no Mail event-loop involvement.
+2. Drops obvious noise (newsletters, auto-replies, mailing lists, junk) with a
+   fast header heuristic — no LLM needed.
+3. Sends the survivors to a local Ollama model for classification.
+4. Appends actionable emails — ones that imply a reply, decision, RSVP, or
+   deadline — as `- [ ]` checkboxes in `Mail Triage.md` in your Obsidian vault.
+5. Color-flags every processed message in Apple Mail via a single JXA call.
 
-The agent wrapper woke up every 5 minutes, but now includes mail app status
-checking to prevent slowdowns:
-
-- When Mail is active (running + focused), the wrapper waits up to 30 minutes,
-  polling every 30 seconds, before proceeding
-- When Mail is idle, the wrapper allows immediate execution
-- Only one run is allowed at a time via lock file
-
-The actual triage logic (fetch, prefilter, classify, queue) remains the same.
-After the status check passes, the agent wakes up, fetches messages that
-arrived since the last run, drops obvious noise (newsletters, auto-replies,
-mailing lists) with a fast header heuristic, and sends the survivors to a
-local Ollama model for classification. Emails that imply a personal action — a
-reply, a decision, an RSVP, a deadline — are appended as `- [ ]` checkboxes to
-`Mail Triage.md` in your Obsidian vault. Everything else is silently recorded
-as seen and never shown again.
+Only one run is allowed at a time (lock file). Everything else is recorded as
+seen in `state.db` and never re-classified.
 
 ---
 
@@ -58,10 +35,15 @@ as seen and never shown again.
 launchd (every 5 min)
         |
         v
+  agent_with_mail_app_status_check.py
+  (lsappinfo frontmost check — no AppleScript)
+        |
+        v
   agent.py
         |
-        +---> osascript (JXA) ---> Apple Mail
-        |       returns NDJSON of new messages
+        +---> fetcher.py ──► ~/Library/Mail/V*/MailData/Envelope Index (SQLite)
+        |                    ~/Library/Mail/V*/<UUID>/**/*.emlx
+        |                    (direct disk reads, ~2 s for 100 messages)
         |
         v
   prefilter.py   (headers + junk flag, no LLM)
@@ -79,10 +61,11 @@ launchd (every 5 min)
         +---------------------------+
                     |
                     v
-          set_flags.js (JXA) ---> Apple Mail
-          (color-flag each message by outcome)
+          set_flags.js (JXA) ──► Apple Mail
+          (color-flag each message; 1 s between flags
+           so Mail's event loop can breathe)
 
-  stats.py  -->  ~/.mail-agent/logs/runs.ndjson
+  stats.py  ──►  ~/.mail-agent/logs/runs.ndjson
 ```
 
 After every run, each processed message is color-flagged in Apple Mail:
@@ -92,11 +75,9 @@ After every run, each processed message is color-flagged in Apple Mail:
 | 🔴 Red | 0 | Actionable — high urgency |
 | 🟠 Orange | 1 | Actionable — medium urgency |
 | 🟡 Yellow | 2 | Actionable — low urgency |
-| ⚫ Grey | 6 | Seen, no action needed (dropped by prefilter or not actionable) |
+| ⚫ Grey | 6 | Seen, no action needed |
 
-Flags are set via `jxa/set_flags.js` at the end of each batch. The flagIndex
-values were determined empirically — they differ from Apple's documentation.
-Both Gmail (IMAP) and Exchange accounts support indices 1–6.
+Flag indices were determined empirically and differ from Apple's documentation.
 
 ---
 
@@ -133,9 +114,22 @@ The install script runs in two steps:
    prompt from the first run). This registers `com.user.mailagent` with
    launchd so the agent runs every 5 minutes automatically.
 
+### Full Disk Access
+
+`fetcher.py` reads `~/Library/Mail/` directly. The binary that launchd invokes
+(`uv`) must have **Full Disk Access**:
+
+System Settings → Privacy & Security → Full Disk Access → add the `uv` binary
+(typically `/opt/homebrew/bin/uv`).
+
+When running the agent manually from the terminal, FDA is inherited from the
+terminal app (Terminal.app or iTerm2), so granting FDA to the terminal is
+sufficient for development.
+
 ### TCC Automation permission
 
-The first time launchd fires the agent, macOS shows a dialog:
+Flag-setting (`set_flags.js`) uses JXA to talk to Mail. The first time launchd
+fires the agent, macOS may show:
 
 > _"osascript" wants access to control "Mail"._
 
@@ -145,7 +139,8 @@ The first time launchd fires the agent, macOS shows a dialog:
 System Settings → Privacy & Security → Automation → find **osascript** →
 enable the toggle next to **Mail**.
 
-You can also trigger the prompt on demand by running the agent manually once:
+You can trigger the prompt on demand by running the agent once in dry-run mode
+(no flags are set, but the JXA call for account listing fires):
 
 ```bash
 cd /Users/martin/projects/mail-agent
@@ -157,20 +152,20 @@ uv run python agent.py --dry-run
 ## Configuration
 
 Config file: `~/.mail-agent/config.toml`. A fully-commented example is at
-`/Users/martin/projects/mail-agent/config.toml.example`.
+`config.toml.example`.
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `start_date` | `"2026-05-03"` | Hard floor — the agent never looks at mail older than this date. Set it to roughly when you started using the agent. **Tune this first if you want to backfill older mail.** |
+| `start_date` | `"2026-05-03"` | Hard floor — the agent never looks at mail older than this date. **Tune this first if you want to backfill older mail.** |
 | `vault_path` | Personal Obsidian path | Absolute path to the root of your Obsidian vault (or any directory). **Must exist.** |
 | `queue_file` | `"Inbox/Mail Triage.md"` | Path *within* the vault for the review queue. Created on first write. |
-| `ollama_model` | `"gemma4:e4b"` | Model used for classification. Must be pulled locally (`ollama pull <model>`). The agent disables the model's "thinking" mode (see [HANDOFF.md](HANDOFF.md)) — if you swap in a model whose JSON output depends on a reasoning preamble, expect quality regressions. |
+| `ollama_model` | `"gemma4:e4b"` | Model used for classification. Must be pulled locally (`ollama pull <model>`). |
 | `poll_interval_minutes` | `5` | Informational — reflects the `StartInterval` in the plist. Change in the plist, not just here. |
-| `max_messages_per_run` | `50` | Cap on how many messages are classified in a single run. Excess is carried to the next run. **Raise this if you see frequent `cap_hit` in `runs.ndjson`; lower it if runs are slow.** |
-| `content_truncate_bytes` | `4096` | Message body is trimmed to this length before sending to the LLM. 4 KB is enough signal; larger values slow inference. |
+| `max_messages_per_run` | `50` | Cap on messages classified per run. Excess is carried to the next run. |
+| `content_truncate_bytes` | `4096` | Message body trimmed to this length before sending to the LLM. |
 | `log_level` | `"INFO"` | `DEBUG`, `INFO`, `WARN`, or `ERROR`. |
-| `mail_app_status_check.poll_delay_seconds` | `30` | Seconds between checks when Mail is active/focused. |
-| `mail_app_status_check.max_wait_minutes` | `30` | Maximum minutes to wait for Mail to become idle before forcing the run. |
+| `mail_app_status_check.poll_delay_seconds` | `30` | Seconds between frontmost-app checks when Mail is active. |
+| `mail_app_status_check.max_wait_minutes` | `30` | Maximum minutes to wait before forcing a run anyway. |
 
 ---
 
@@ -183,27 +178,19 @@ code change.
 
 ### Iterating without re-fetching from Mail
 
-Fetching messages from Apple Mail has a per-message IPC cost (~7s each).
-To avoid paying it on every prompt iteration, first dump a small fixed
-dataset of today's classifier-bound messages, then replay that dataset
-as many times as you like.
+To avoid paying the fetch cost on every prompt iteration, first dump a fixed
+dataset of today's classifier-bound messages, then replay it as many times as
+you like.
 
-**Step 1 — Dump candidates** (run once per dataset, requires Mail):
+**Step 1 — Dump candidates** (run once per dataset):
 
 ```bash
 uv run python dump_candidates.py
-```
-
-This fetches the last 48 hours of mail, applies the prefilter, and saves
-every message that would reach the classifier to
-`~/.mail-agent/candidates.json`. Dropped messages (newsletters, no-reply,
-etc.) are shown but not saved. A drop-reason summary is printed at the end.
-
-To fetch a specific window instead:
-
-```bash
+# or for a specific window:
 uv run python dump_candidates.py --since "2026-05-04T00:00:00"
 ```
+
+Fetches messages, applies prefilter, saves survivors to `~/.mail-agent/candidates.json`.
 
 **Step 2 — Classify and review** (fast, no Mail access):
 
@@ -236,23 +223,6 @@ edit prompts/classify_system.md
 uv run python run_classifier.py
 ```
 
-The prompt is reloaded on every `run_classifier.py` invocation. The
-candidate dataset stays fixed until you re-run `dump_candidates.py`.
-
-### Prompt strategy notes
-
-- Keep the prompt short. The model sees it on every message; a 200-token
-  system prompt is fine, a 2000-token one adds latency and rarely helps.
-- Be concrete about what "actionable" means for *your* inbox. The default
-  prompt errs toward false negatives (misses) rather than false positives
-  (noise in the queue); adjust the threshold to your preference.
-- Urgency is the hardest field to get right. If urgency calibration is
-  off, add examples to the prompt rather than changing the definition.
-- `run_classifier.py --truncate-bytes N` lets you experiment with how
-  much message body the model sees. Candidates are stored at 16 KB;
-  production uses 4 KB. Larger context rarely changes outcomes for short
-  personal emails but can matter for dense threads.
-
 ---
 
 ## Daily use
@@ -273,26 +243,19 @@ Each actionable message gets a block like:
   - Account: martin.aryee@gmail.com
 ```
 
-- **Tick the checkbox** (`- [x]`) to mark an item done. The agent never
-  modifies completed items.
-- **Click "Open in Mail"** to jump directly to the original message in Apple
-  Mail.
-- The file is yours — edit freely, reorder items, copy rows to another task
-  list, delete false positives. The agent only appends; it never rewrites
-  existing lines.
-- An empty file is the normal state when you're caught up. It is not an error.
+- **Tick the checkbox** (`- [x]`) to mark done. The agent never modifies completed items.
+- **Click "Open in Mail"** to jump directly to the original message.
+- The file is yours — edit freely. The agent only appends; it never rewrites existing lines.
+- An empty file is normal when you're caught up. It is not an error.
 
 ---
 
 ## Running manually / testing
 
-You can invoke the agent directly at any time — useful for testing, backfilling
-a time window, or watching what it does before enabling the launchd job.
-
 ```bash
 cd /Users/martin/projects/mail-agent
 
-# Dry-run with verbose output from a specific time (no writes to queue or state.db)
+# Dry-run with verbose output from a specific time (no writes)
 uv run python agent.py --dry-run --verbose --since "2026-05-04T17:00:00"
 ```
 
@@ -300,9 +263,9 @@ uv run python agent.py --dry-run --verbose --since "2026-05-04T17:00:00"
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Classify messages but write nothing — no queue updates, no state.db entries, no runs.ndjson record. Safe to run repeatedly. |
-| `--verbose` / `-v` | Print one status line per message to stderr as it is processed, so you can watch progress in real time. Without this flag only queued items are logged. |
-| `--since <ISO8601>` | Override the start of the fetch window. Bare timestamps (no `Z` or offset) are interpreted as local time. |
+| `--dry-run` | Classify messages but write nothing — no queue updates, no state.db entries, no runs.ndjson record. |
+| `--verbose` / `-v` | Print one status line per message to stderr as it is processed. |
+| `--since <ISO8601>` | Override the start of the fetch window. |
 
 **Verbose output looks like:**
 
@@ -316,32 +279,32 @@ Fetching messages since 2026-05-04T17:00:00 …
 Done: 4 message(s) processed
 ```
 
-Tags: `DROP <reason>`, `SKIP already-seen`, `SKIP no-message-id`, `CLASSIFYING...`,
-`ACTIONABLE [urgency]`, `not actionable`, `ERROR classify-crash`.
+### Benchmark fetch vs classify
+
+```bash
+# Benchmark disk-based fetcher (default)
+uv run python bench.py --since "2026-05-01T00:00:00" --max 100
+
+# Also benchmark legacy JXA fetcher for comparison (~2 min)
+uv run python bench.py --since "2026-05-01T00:00:00" --max 100 --run-jxa
+```
 
 ---
 
 ## Reset / starting over
 
-The queue file and `state.db` are independent. Deleting only the queue file
-does **not** cause the agent to reprocess old mail — that's intentional,
-because an empty queue is the normal steady state.
-
-To redo the triage from scratch, delete **both**:
+To redo triage from scratch, delete both the queue file and state:
 
 ```bash
 rm "$VAULT_PATH/Inbox/Mail Triage.md"
 rm ~/.mail-agent/state.db
 ```
 
-Or use the convenience flag, which prompts for confirmation before deleting:
+Or use the convenience flag (prompts for confirmation):
 
 ```bash
-cd /Users/martin/projects/mail-agent
 uv run python agent.py --reset
 ```
-
-After a reset, the agent starts fresh from `start_date` on its next run.
 
 ---
 
@@ -349,60 +312,43 @@ After a reset, the agent starts fresh from `start_date` on its next run.
 
 ### "It hasn't run"
 
-Check the launchd job status:
-
 ```bash
+# Check launchd job status
 launchctl print gui/$UID/com.user.mailagent
-```
 
-Watch the live log:
-
-```bash
+# Watch the live log
 tail -f ~/.mail-agent/logs/agent.log
 ```
 
-### "Permission denied" / Mail access errors
+### "Permission denied" reading mail / fetcher errors
 
-This is a TCC issue. Go to System Settings → Privacy & Security → Automation.
-If osascript does not appear under Mail, run the agent once manually to trigger
-the prompt:
+The `uv` binary needs **Full Disk Access** for launchd runs. See [Full Disk
+Access](#full-disk-access) above. For manual runs, the terminal app needs FDA.
 
-```bash
-cd /Users/martin/projects/mail-agent
-uv run python agent.py --dry-run
-```
+### "Permission denied" setting flags / Automation errors
+
+`set_flags.js` uses JXA to talk to Mail. Grant **osascript → Mail** in System
+Settings → Privacy & Security → Automation.
 
 ### "Ollama errors" / classifier not responding
 
-Verify Ollama is up:
-
 ```bash
-curl -s localhost:11434/api/tags
-```
-
-This should return JSON listing your local models. If it fails, start Ollama:
-
-```bash
-ollama serve &
-# or open the Ollama app
+curl -s localhost:11434/api/tags   # should return model list JSON
+ollama serve &                     # if it fails, start Ollama
 ```
 
 ### "Hitting the cap"
-
-Check recent runs:
 
 ```bash
 tail -50 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
 ```
 
-If `cap_hit` appears repeatedly, raise `max_messages_per_run` in
-`~/.mail-agent/config.toml`, or shorten `poll_interval_minutes` in the plist
-and reload it.
+If `cap_hit` appears repeatedly, raise `max_messages_per_run` in config.
 
 ### "False positives in the queue"
 
 Delete those lines from `Mail Triage.md`. The agent will not re-add them —
-`state.db` already has those message IDs recorded as seen.
+`state.db` has those message IDs recorded as seen.
 
 ---
 
@@ -412,7 +358,7 @@ Each run appends one JSON record to `~/.mail-agent/logs/runs.ndjson`. Example:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run_id": "2026-05-03T15:30:00Z-7f3a",
   "started_at": "2026-05-03T15:30:00.123Z",
   "ended_at": "2026-05-03T15:30:18.901Z",
@@ -449,22 +395,13 @@ tail -50 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
 
 # How many messages were actionable today?
 grep "$(date -u +%Y-%m-%d)" ~/.mail-agent/logs/runs.ndjson | jq '.counts.actionable' | awk '{s+=$1}END{print s}'
-
-# Mail app status delays (last 20 runs)
-tail -20 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.mail_app_status != null) | [.started_at, .mail_app_status.skipped_mail_active, .mail_app_status.waited_seconds] | @tsv'
 ```
 
-For heavier analysis, load the file into pandas:
+For heavier analysis:
 
 ```python
 import pandas as pd
 df = pd.read_json("~/.mail-agent/logs/runs.ndjson", lines=True)
-```
-
-Or DuckDB:
-
-```sql
-SELECT * FROM read_ndjson_auto('~/.mail-agent/logs/runs.ndjson');
 ```
 
 ---
@@ -476,10 +413,7 @@ SELECT * FROM read_ndjson_auto('~/.mail-agent/logs/runs.ndjson');
   ```bash
   lsof -i -P | grep agent.py
   ```
-  The only entry should show `localhost:11434`.
 - No telemetry. No cloud APIs. No data leaves your machine.
-- The model weights are stored locally by Ollama, typically under
-  `~/.ollama/models/` (~10 GB on disk for `gemma4:e4b`).
 
 ---
 
@@ -490,14 +424,10 @@ cd /Users/martin/projects/mail-agent
 ./uninstall.sh
 ```
 
-This unloads the launchd job and removes the plist. It does **not** delete your
-user data. To fully wipe everything:
+This unloads the launchd job and removes the plist. To fully wipe everything:
 
 ```bash
-# Remove the queue file from your vault
-rm "/Users/martin/Dropbox (Personal)/Obsidian - Personal/Inbox/Mail Triage.md"
-
-# Remove agent state, logs, and config
+rm "/path/to/your/vault/Inbox/Mail Triage.md"
 rm -rf ~/.mail-agent
 ```
 
@@ -506,11 +436,7 @@ rm -rf ~/.mail-agent
 ## Out of scope (v1)
 
 - Drafting reply text — the agent enqueues the action item; composing the reply is manual.
-- Per-account routing — all accounts feed a single configured vault. Work mail
-  and personal mail go to the same queue file.
-- Two-way sync — checking off an item in Obsidian does not archive or mark the
-  original email as read in Mail.
+- Per-account routing — all accounts feed a single configured vault.
+- Two-way sync — checking off an item in Obsidian does not archive or flag the original email.
 - Snooze, due dates, or recurrence.
-- HTML-to-text fidelity — Mail's `content` property is plaintext-ish; complex
-  HTML emails may produce noisy snippets, which is acceptable for a
-  classification signal.
+- Flag-setting for Gmail messages stored in `[Gmail]/All Mail` — JXA can't resolve nested mailbox names, so Gmail messages are classified correctly but don't receive color flags.
