@@ -31,7 +31,7 @@ import fetcher as fetcher_mod
 from prefilter import filter_message
 
 JXA_SCRIPT = Path(__file__).resolve().parent / "jxa" / "fetch_new_messages.js"
-DEFAULT_CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
+DEFAULT_CONFIG_PATH = Path.home() / ".apple-mail-triage" / "config.toml"
 
 
 def _load_config():

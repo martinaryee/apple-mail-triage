@@ -1,5 +1,5 @@
 """
-stats.py — per-run telemetry accumulator for mail-agent.
+stats.py — per-run telemetry accumulator for apple-mail-triage.
 
 Creates one NDJSON line per invocation; designed so the user can later load
 runs.ndjson into pandas/duckdb to tune max_messages_per_run and compare

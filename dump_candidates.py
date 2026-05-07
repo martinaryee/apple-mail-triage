@@ -4,7 +4,7 @@
 Run once to build a test dataset, then iterate on prompts using
 run_classifier.py without touching Apple Mail again.
 
-Output: ~/.mail-agent/candidates.json  (one JSON array of message dicts)
+Output: ~/.apple-mail-triage/candidates.json  (one JSON array of message dicts)
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 from agent import stream_messages
 from prefilter import filter_message
 
-CANDIDATES_PATH = Path.home() / ".mail-agent" / "candidates.json"
+CANDIDATES_PATH = Path.home() / ".apple-mail-triage" / "candidates.json"
 # Store more content than production so run_classifier.py can experiment
 # with different truncation levels without re-dumping.
 _DUMP_TRUNCATE_BYTES = 16_384

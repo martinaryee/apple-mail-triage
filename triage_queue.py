@@ -22,7 +22,7 @@ _FILE_HEADER = """\
 <!-- Mail-to-Todo agent appends candidate action items below.
      Tick the box and (optionally) cut/paste into your real task list.
      To redo the triage from scratch, delete THIS FILE *and*
-     ~/.mail-agent/state.db. -->
+     ~/.apple-mail-triage/state.db. -->
 """
 
 

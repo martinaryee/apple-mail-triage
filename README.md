@@ -1,4 +1,4 @@
-# Mail Agent
+# Apple Mail Triage Agent
 
 Triages new Apple Mail messages every 5 minutes using a local LLM. Actionable
 emails are color-flagged in Mail and, optionally, queued as checkboxes in a
@@ -66,7 +66,7 @@ launchd (every 5 min)
           (color-flag each message; 1 s between flags
            so Mail's event loop can breathe)
 
-  stats.py  ──►  ~/.mail-agent/logs/runs.ndjson
+  stats.py  ──►  ~/.apple-mail-triage/logs/runs.ndjson
 ```
 
 After every run, each processed message is color-flagged in Apple Mail:
@@ -98,21 +98,21 @@ Flag indices were determined empirically and differ from Apple's documentation.
 ## Install
 
 ```bash
-cd /Users/martin/projects/mail-agent
+cd /Users/martin/projects/apple-mail-triage
 ./install.sh
 ```
 
 The install script runs in two steps:
 
-1. **First run**: creates `~/.mail-agent/` and its subdirectories, pulls
+1. **First run**: creates `~/.apple-mail-triage/` and its subdirectories, pulls
    `gemma4:e4b` via Ollama if it isn't already on disk (~10 GB), and writes a
-   starter config to `~/.mail-agent/config.toml`.
+   starter config to `~/.apple-mail-triage/config.toml`.
 
-2. **Edit the config**: open `~/.mail-agent/config.toml` and set at least
+2. **Edit the config**: open `~/.apple-mail-triage/config.toml` and set at least
    `vault_path` and `start_date` (see [Configuration](#configuration) below).
 
 3. **Load the launchd job**: run `./install.sh` a second time (or follow the
-   prompt from the first run). This registers `com.user.mailagent` with
+   prompt from the first run). This registers `com.user.apple-mail-triage` with
    launchd so the agent runs every 5 minutes automatically.
 
 ### Full Disk Access
@@ -144,7 +144,7 @@ You can trigger the prompt on demand by running the agent once in dry-run mode
 (no flags are set, but the JXA call for account listing fires):
 
 ```bash
-cd /Users/martin/projects/mail-agent
+cd /Users/martin/projects/apple-mail-triage
 uv run python agent.py --dry-run
 ```
 
@@ -152,7 +152,7 @@ uv run python agent.py --dry-run
 
 ## Configuration
 
-Config file: `~/.mail-agent/config.toml`. A fully-commented example is at
+Config file: `~/.apple-mail-triage/config.toml`. A fully-commented example is at
 `config.toml.example`.
 
 | Key | Default | What it does |
@@ -192,7 +192,7 @@ uv run python dump_candidates.py
 uv run python dump_candidates.py --since "2026-05-04T00:00:00"
 ```
 
-Fetches messages, applies prefilter, saves survivors to `~/.mail-agent/candidates.json`.
+Fetches messages, applies prefilter, saves survivors to `~/.apple-mail-triage/candidates.json`.
 
 **Step 2 — Classify and review** (fast, no Mail access):
 
@@ -268,7 +268,7 @@ Each entry looks like:
 ## Running manually / testing
 
 ```bash
-cd /Users/martin/projects/mail-agent
+cd /Users/martin/projects/apple-mail-triage
 
 # Dry-run with verbose output from a specific time (no writes)
 uv run python agent.py --dry-run --verbose --since "2026-05-04T17:00:00"
@@ -313,7 +313,7 @@ state:
 
 ```bash
 rm "$VAULT_PATH/Inbox/Mail Triage.md"   # skip if enable_triage_queue = false
-rm ~/.mail-agent/state.db
+rm ~/.apple-mail-triage/state.db
 ```
 
 Or use the convenience flag (prompts for confirmation, skips queue file if
@@ -331,10 +331,10 @@ uv run python agent.py --reset
 
 ```bash
 # Check launchd job status
-launchctl print gui/$UID/com.user.mailagent
+launchctl print gui/$UID/com.user.apple-mail-triage
 
 # Watch the live log
-tail -f ~/.mail-agent/logs/agent.log
+tail -f ~/.apple-mail-triage/logs/agent.log
 ```
 
 ### "Permission denied" reading mail / fetcher errors
@@ -357,7 +357,7 @@ ollama serve &                     # if it fails, start Ollama
 ### "Hitting the cap"
 
 ```bash
-tail -50 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
+tail -50 ~/.apple-mail-triage/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
 ```
 
 If `cap_hit` appears repeatedly, raise `max_messages_per_run` in config.
@@ -371,7 +371,7 @@ Delete those lines from `Mail Triage.md`. The agent will not re-add them —
 
 ## Reading runs.ndjson
 
-Each run appends one JSON record to `~/.mail-agent/logs/runs.ndjson`. Example:
+Each run appends one JSON record to `~/.apple-mail-triage/logs/runs.ndjson`. Example:
 
 ```json
 {
@@ -402,23 +402,23 @@ Useful one-liners:
 
 ```bash
 # Latest run summary
-tail -1 ~/.mail-agent/logs/runs.ndjson | jq
+tail -1 ~/.apple-mail-triage/logs/runs.ndjson | jq
 
 # Average LLM latency over last 100 runs
-tail -100 ~/.mail-agent/logs/runs.ndjson | jq '.llm_ms.mean' | awk '{s+=$1;n++}END{print s/n"ms"}'
+tail -100 ~/.apple-mail-triage/logs/runs.ndjson | jq '.llm_ms.mean' | awk '{s+=$1;n++}END{print s/n"ms"}'
 
 # Were we capped recently?
-tail -50 ~/.mail-agent/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
+tail -50 ~/.apple-mail-triage/logs/runs.ndjson | jq -r 'select(.cap_hit) | .run_id'
 
 # How many messages were actionable today?
-grep "$(date -u +%Y-%m-%d)" ~/.mail-agent/logs/runs.ndjson | jq '.counts.actionable' | awk '{s+=$1}END{print s}'
+grep "$(date -u +%Y-%m-%d)" ~/.apple-mail-triage/logs/runs.ndjson | jq '.counts.actionable' | awk '{s+=$1}END{print s}'
 ```
 
 For heavier analysis:
 
 ```python
 import pandas as pd
-df = pd.read_json("~/.mail-agent/logs/runs.ndjson", lines=True)
+df = pd.read_json("~/.apple-mail-triage/logs/runs.ndjson", lines=True)
 ```
 
 ---
@@ -437,7 +437,7 @@ df = pd.read_json("~/.mail-agent/logs/runs.ndjson", lines=True)
 ## Uninstall
 
 ```bash
-cd /Users/martin/projects/mail-agent
+cd /Users/martin/projects/apple-mail-triage
 ./uninstall.sh
 ```
 
@@ -445,7 +445,7 @@ This unloads the launchd job and removes the plist. To fully wipe everything:
 
 ```bash
 rm "/path/to/your/vault/Inbox/Mail Triage.md"
-rm -rf ~/.mail-agent
+rm -rf ~/.apple-mail-triage
 ```
 
 ---

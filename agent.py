@@ -32,10 +32,10 @@ from state import State
 from stats import RunStats
 from triage_queue import append_block, existing_message_ids
 
-DEFAULT_CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
-DEFAULT_DB_PATH = Path.home() / ".mail-agent" / "state.db"
-DEFAULT_LOG_DIR = Path.home() / ".mail-agent" / "logs"
-DEFAULT_LOCK_PATH = Path.home() / ".mail-agent" / "agent.lock"
+DEFAULT_CONFIG_PATH = Path.home() / ".apple-mail-triage" / "config.toml"
+DEFAULT_DB_PATH = Path.home() / ".apple-mail-triage" / "state.db"
+DEFAULT_LOG_DIR = Path.home() / ".apple-mail-triage" / "logs"
+DEFAULT_LOCK_PATH = Path.home() / ".apple-mail-triage" / "agent.lock"
 JXA_SET_FLAGS  = Path(__file__).resolve().parent / "jxa" / "set_flags.js"
 
 _FLAG_GRAY   = 6  # processed, no action needed (grey — works on Gmail + Exchange)

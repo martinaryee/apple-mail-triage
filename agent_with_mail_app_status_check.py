@@ -20,9 +20,9 @@ from pathlib import Path
 from stats import RunStats
 
 # Paths
-DEFAULT_LOCK_PATH = Path.home() / ".mail-agent" / "agent.lock"
-DEFAULT_LOG_DIR = Path.home() / ".mail-agent" / "logs"
-DEFAULT_CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
+DEFAULT_LOCK_PATH = Path.home() / ".apple-mail-triage" / "agent.lock"
+DEFAULT_LOG_DIR = Path.home() / ".apple-mail-triage" / "logs"
+DEFAULT_CONFIG_PATH = Path.home() / ".apple-mail-triage" / "config.toml"
 AGENT_SCRIPT = Path(__file__).resolve().parent / "agent.py"
 
 # Polling defaults
@@ -157,7 +157,7 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Wrapper for mail-agent that checks mail app status.")
+    ap = argparse.ArgumentParser(description="Wrapper for apple-mail-triage that checks mail app status.")
     ap.add_argument(
         "--config",
         type=Path,

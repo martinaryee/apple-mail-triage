@@ -1,4 +1,4 @@
-# Mail-to-Todo agent configuration. Copy to ~/.mail-agent/config.toml and edit.
+# Mail-to-Todo agent configuration. Copy to ~/.apple-mail-triage/config.toml and edit.
 
 # Lower bound — agent never looks at messages received before this date.
 # Used (a) on first run when state.db is empty, and (b) any time you manually

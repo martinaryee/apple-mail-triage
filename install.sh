@@ -2,23 +2,23 @@
 set -euo pipefail
 
 # ============================================================
-#  Mail-Agent Install Script
+#  Apple Mail Triage Agent Install Script
 #  Installs the launchd job that runs the status-aware agent
 #  wrapper every 5 minutes.
 # ============================================================
 
-LABEL="com.user.mailagent"
-PROJECT_DIR="/Users/martin/projects/mail-agent"
-PLIST_SRC="${PROJECT_DIR}/com.user.mailagent.plist"
-PLIST_DST="${HOME}/Library/LaunchAgents/com.user.mailagent.plist"
-CONFIG_DIR="${HOME}/.mail-agent"
+LABEL="com.user.apple-mail-triage"
+PROJECT_DIR="/Users/martin/projects/apple-mail-triage"
+PLIST_SRC="${PROJECT_DIR}/com.user.apple-mail-triage.plist"
+PLIST_DST="${HOME}/Library/LaunchAgents/com.user.apple-mail-triage.plist"
+CONFIG_DIR="${HOME}/.apple-mail-triage"
 LOG_DIR="${CONFIG_DIR}/logs"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 CONFIG_EXAMPLE="${PROJECT_DIR}/config.toml.example"
 
 echo ""
 echo "========================================"
-echo "  Mail-Agent Installer"
+echo "  Apple Mail Triage Agent Installer"
 echo "========================================"
 echo ""
 
@@ -70,7 +70,7 @@ else
 fi
 
 # ----------------------------------------------------------
-# 4. Create ~/.mail-agent/logs/ if missing
+# 4. Create ~/.apple-mail-triage/logs/ if missing
 # ----------------------------------------------------------
 if [[ ! -d "${LOG_DIR}" ]]; then
     mkdir -p "${LOG_DIR}"
@@ -134,7 +134,7 @@ echo ""
 echo "      The very first time the agent calls Apple Mail via AppleScript,"
 echo "      macOS will display a system dialog:"
 echo ""
-echo "        \"mail-agent wants access to control Mail.\""
+echo "        \"apple-mail-triage wants access to control Mail.\""
 echo ""
 echo "      You MUST click Allow in that dialog for the agent to work."
 echo ""
@@ -155,13 +155,13 @@ echo ""
 echo "  Next run: within 5 minutes (RunAtLoad triggered an immediate run)"
 echo ""
 echo "  Watch the live log:"
-echo "    tail -f ~/.mail-agent/logs/agent.log"
+echo "    tail -f ~/.apple-mail-triage/logs/agent.log"
 echo ""
 echo "  Review structured run stats:"
-echo "    cat ~/.mail-agent/logs/runs.ndjson"
+echo "    cat ~/.apple-mail-triage/logs/runs.ndjson"
 echo ""
 echo "  Check mail app status delays in runs:"
-echo "    jq -r '.mail_app_status' ~/.mail-agent/logs/runs.ndjson | head -20"
+echo "    jq -r '.mail_app_status' ~/.apple-mail-triage/logs/runs.ndjson | head -20"
 echo ""
 echo "  Check launchd status:"
 echo "    launchctl print gui/${UID}/${LABEL}"

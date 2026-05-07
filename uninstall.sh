@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # ============================================================
-#  Mail-Agent Uninstall Script
+#  Apple Mail Triage Agent Uninstall Script
 #  Removes the launchd job. Does NOT delete user data.
 # ============================================================
 
-LABEL="com.user.mailagent"
-PLIST_DST="${HOME}/Library/LaunchAgents/com.user.mailagent.plist"
+LABEL="com.user.apple-mail-triage"
+PLIST_DST="${HOME}/Library/LaunchAgents/com.user.apple-mail-triage.plist"
 
 echo ""
 echo "========================================"
-echo "  Mail-Agent Uninstaller"
+echo "  Apple Mail Triage Agent Uninstaller"
 echo "========================================"
 echo ""
 
@@ -35,12 +35,12 @@ echo "========================================"
 echo "  Uninstall complete"
 echo "========================================"
 echo ""
-echo "  User data preserved at ~/.mail-agent/"
-echo "  To wipe it:  rm -rf ~/.mail-agent/"
+echo "  User data preserved at ~/.apple-mail-triage/"
+echo "  To wipe it:  rm -rf ~/.apple-mail-triage/"
 echo ""
 echo "  Queue file preserved at:"
 echo "    /Users/martin/Dropbox (Personal)/Obsidian - Personal/Inbox/Mail Triage.md"
 echo "  Delete manually if desired."
 echo ""
-echo "  The project source at ~/projects/mail-agent/ is untouched."
+echo "  The project source at ~/projects/apple-mail-triage/ is untouched."
 echo ""

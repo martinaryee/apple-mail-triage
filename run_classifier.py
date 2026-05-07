@@ -19,8 +19,8 @@ from pathlib import Path
 
 import classify as classify_mod
 
-CANDIDATES_PATH = Path.home() / ".mail-agent" / "candidates.json"
-CONFIG_PATH = Path.home() / ".mail-agent" / "config.toml"
+CANDIDATES_PATH = Path.home() / ".apple-mail-triage" / "candidates.json"
+CONFIG_PATH = Path.home() / ".apple-mail-triage" / "config.toml"
 
 
 def _load_model() -> str:

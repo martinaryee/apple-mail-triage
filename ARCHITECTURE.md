@@ -16,7 +16,7 @@ source of actionable items. Per-run telemetry goes to NDJSON.
 ## File layout
 
 ```
-mail-agent/
+apple-mail-triage/
 ├── agent.py                        # Orchestrator (CLI: --dry-run, --reset, --since)
 ├── agent_with_mail_app_status_check.py  # launchd entry point; polls lsappinfo before running
 ├── fetcher.py                      # Disk-based message reader (Envelope Index + .emlx)
@@ -26,7 +26,7 @@ mail-agent/
 ├── state.py                        # SQLite cache of (message_id → outcome)
 ├── stats.py                        # RunStats accumulator → runs.ndjson
 ├── bench.py                        # A/B benchmark: disk fetch vs legacy JXA fetch
-├── dump_candidates.py              # Dump prefilter survivors to ~/.mail-agent/candidates.json
+├── dump_candidates.py              # Dump prefilter survivors to ~/.apple-mail-triage/candidates.json
 ├── run_classifier.py               # Replay candidates.json through the classifier
 ├── jxa/
 │   ├── set_flags.js                # JXA: color-flag messages in Mail after classification
@@ -36,14 +36,14 @@ mail-agent/
 │   └── classify_system.md          # LLM system prompt — edit to retune without code changes
 ├── tests/                          # 95 pytest tests covering all components
 ├── config.toml.example             # Starter config
-├── com.user.mailagent.plist        # launchd job (StartInterval 300s)
+├── com.user.apple-mail-triage.plist        # launchd job (StartInterval 300s)
 └── install.sh / uninstall.sh       # Setup scripts
 ```
 
 User data lives outside the repo:
 
 ```
-~/.mail-agent/
+~/.apple-mail-triage/
 ├── config.toml                     # User config (copied from config.toml.example)
 ├── state.db                        # SQLite cache of processed message-ids
 ├── candidates.json                 # Last dump_candidates.py output (gitignored)
@@ -64,7 +64,7 @@ lsappinfo front → check if Mail is frontmost (no AppleScript)
    ↓
 agent.py main()
    ↓
-load config (~/.mail-agent/config.toml)
+load config (~/.apple-mail-triage/config.toml)
    ↓
 compute_since(state.db, start_date)     # MAX(date_received) across processed; falls back to start_date
    ↓
@@ -215,7 +215,7 @@ the disk-based path.
 ## Tests
 
 ```bash
-cd /Users/martin/projects/mail-agent
+cd /Users/martin/projects/apple-mail-triage
 uv run pytest tests/ -q
 ```
 
