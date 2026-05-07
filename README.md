@@ -19,8 +19,8 @@ The agent wakes up every 5 minutes, checks whether Mail is the frontmost app
 2. Drops obvious noise (newsletters, auto-replies, mailing lists, junk) with a
    fast header heuristic — no LLM needed.
 3. Sends the survivors to a local Ollama model for classification.
-4. Color-flags every processed message in Apple Mail (orange/red = actionable,
-   grey = not actionable).
+4. Color-flags every processed message in Apple Mail (red/orange/yellow =
+   actionable by urgency, grey = not actionable).
 5. Optionally appends actionable emails as `- [ ]` checkboxes to `Mail
    Triage.md` in your Obsidian vault — set `enable_triage_queue = false` in
    config to skip this step and use flagging only.
