@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Mail-to-todo orchestrator. Run via launchd every N minutes.
 
-Pipeline per run: fetch new messages from Apple Mail (JXA) -> prefilter
-heuristics -> classify with local Ollama -> append actionable items to a
-markdown review queue in Obsidian -> record outcome in SQLite cache and
-runs.ndjson.
+Pipeline per run: read new messages from Apple Mail's Envelope Index + .emlx
+files (fetcher.py, no AppleScript) -> prefilter heuristics -> classify with
+local Ollama -> append actionable items to a markdown review queue in Obsidian
+-> record outcome in SQLite cache and runs.ndjson -> color-flag in Mail (JXA).
 """
 
 from __future__ import annotations

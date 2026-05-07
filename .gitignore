@@ -11,3 +11,6 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# Claude Code session data
+.claude/

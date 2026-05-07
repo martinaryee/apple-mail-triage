@@ -5,8 +5,7 @@ actionable ones as checkboxes in a markdown file inside your Obsidian vault.
 Everything runs on-device — no email content, metadata, or message subjects
 ever leave your Mac.
 
-For the original design rationale, see [PLAN-1.md](PLAN-1.md). For a tour of
-the code as it stands today, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For a tour of the code as it stands today, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
