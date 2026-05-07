@@ -1,5 +1,4 @@
 #!/usr/bin/env osascript -l JavaScript
-'use strict';
 
 /**
  * set_flags.js — set Apple Mail flag colors on a list of messages.
@@ -79,6 +78,11 @@ function run(argv) {
       // flagIndex assignment to throw "AppleEvent handler failed".
       msg.flagIndex = a.flagIndex;
       ok++;
+      // Yield 1 s between messages so Mail's event loop can breathe and
+      // handle user interactions between flag-set operations.
+      if (i < assignments.length - 1) {
+        $.NSThread.sleepForTimeInterval(1.0);
+      }
     } catch (e) {
       writeStderr('Error flagging id=' + msgId + ': ' + e.message);
       failed++;
