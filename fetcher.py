@@ -24,6 +24,7 @@ import plistlib
 import re
 import sqlite3
 import subprocess
+import urllib.parse
 from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -75,10 +76,17 @@ def find_mail_dir() -> Path:
 
 
 def find_envelope_index(mail_dir: Path) -> Path:
-    p = mail_dir.parent / "MailData" / "Envelope Index"
-    if not p.exists():
-        raise FileNotFoundError(f"Envelope Index not found at {p}")
-    return p
+    # MailData has lived in two places across macOS versions:
+    #   modern: ~/Library/Mail/V<N>/MailData/Envelope Index
+    #   older:  ~/Library/Mail/MailData/Envelope Index
+    # Probe both before giving up.
+    for candidate in (mail_dir / "MailData" / "Envelope Index",
+                      mail_dir.parent / "MailData" / "Envelope Index"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Envelope Index not found under {mail_dir} or {mail_dir.parent}"
+    )
 
 
 # ── Account UUID → friendly name (one-shot JXA call) ────────────────────────
@@ -118,6 +126,36 @@ def load_account_map() -> dict[str, str]:
 
 
 # ── Time conversion ──────────────────────────────────────────────────────────
+#
+# IMPORTANT — Envelope Index epoch:
+#   The messages.date_received / date_sent columns in the Envelope Index are
+#   plain Unix timestamps (seconds since 1970-01-01 UTC), NOT Core Data
+#   timestamps. Use _iso_to_unix / _unix_to_iso for any SQL comparisons.
+#
+#   The Core Data helpers below are kept because .emlx plist footers and some
+#   other Apple data structures do use the Core Data epoch (2001-01-01 UTC),
+#   and they are unit-tested separately.
+
+
+def _iso_to_unix(iso: str) -> float:
+    """Convert ISO-8601 to a plain Unix timestamp. Used for Envelope Index SQL."""
+    s = iso.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _unix_to_iso(ts: float | int | None) -> str:
+    """Convert a plain Unix timestamp to ISO-8601. Used for Envelope Index dates."""
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return ""
 
 
 def _iso_to_core_data(iso: str) -> float:
@@ -290,18 +328,55 @@ def _truncate_to_bytes(s: str, max_bytes: int) -> str:
 def _emlx_path(mail_dir: Path, account_uuid: str, mailbox_name: str, msg_id: int) -> Optional[Path]:
     """Find the .emlx file for a (account, mailbox, msg_id) tuple.
 
-    Apple Mail buckets messages by digit segments of the ID:
+    Apple Mail's on-disk layout has evolved across macOS versions:
+
+      Older layout (no sub-UUID):
         V*/<UUID>/<mailbox>.mbox/Data/<a>/<b>/Messages/<id>.emlx
-    The exact bucketing has shifted across macOS versions, so we glob the
-    bounded (10×10) bucket directories rather than computing them. The
-    glob hits ≤2 directories per ID, so cost is negligible.
+
+      Modern layout (with sub-UUID; all known current installs):
+        V*/<UUID>/<mailbox>.mbox/<sub-UUID>/Data/<a>/<b>/<c>/Messages/<id>.emlx
+
+    Bucket depth also varies: Exchange uses 3 levels, IMAP/Gmail 0–2.
+    We discover the Data directory by inspecting the mbox directory, then
+    try all observed bucket depths (0–3). Cost is O(1) directory listings
+    plus a handful of bounded globs.
+
+    Nested mailbox paths (e.g. "[Gmail]/All Mail") map to nested .mbox
+    directories on disk: each path segment gets its own .mbox suffix.
+        "[Gmail]/All Mail" → [Gmail].mbox/All Mail.mbox/
+        "Inbox"            → Inbox.mbox/
+    mailbox_name must already be URL-decoded (handled by _parse_mailbox_url).
     """
-    mbox_dir = mail_dir / account_uuid / f"{mailbox_name}.mbox"
+    # Build the .mbox directory path: each "/" in the mailbox name means a
+    # nested .mbox directory on disk.
+    mbox_dir = mail_dir / account_uuid
+    for segment in mailbox_name.split("/"):
+        mbox_dir = mbox_dir / f"{segment}.mbox"
     if not mbox_dir.is_dir():
         return None
+
+    # Collect candidate Data/ directories: directly under mbox_dir (older
+    # layout) and under any sub-UUID child directory (modern layout).
+    data_dirs: list[Path] = []
+    if (mbox_dir / "Data").is_dir():
+        data_dirs.append(mbox_dir / "Data")
+    try:
+        for child in mbox_dir.iterdir():
+            if child.is_dir() and (child / "Data").is_dir():
+                data_dirs.append(child / "Data")
+    except OSError:
+        pass
+
     for ext in (".emlx", ".partial.emlx"):
-        for hit in mbox_dir.glob(f"Data/*/*/Messages/{msg_id}{ext}"):
-            return hit
+        for data_dir in data_dirs:
+            for bucket_pattern in (
+                f"Messages/{msg_id}{ext}",          # 0-level bucket
+                f"*/Messages/{msg_id}{ext}",         # 1-level bucket
+                f"*/*/Messages/{msg_id}{ext}",       # 2-level bucket
+                f"*/*/*/Messages/{msg_id}{ext}",     # 3-level bucket (Exchange)
+            ):
+                for hit in data_dir.glob(bucket_pattern):
+                    return hit
     return None
 
 
@@ -325,7 +400,7 @@ def stream_messages_since(
         return
 
     try:
-        since_cd = _iso_to_core_data(since_iso)
+        since_unix = _iso_to_unix(since_iso)  # Envelope Index uses plain Unix timestamps
     except (ValueError, TypeError) as e:
         yield None, f"bad since timestamp {since_iso!r}: {e}"
         return
@@ -344,6 +419,14 @@ def stream_messages_since(
     # Modern Mail.app stores subject/sender as foreign keys into separate
     # tables; we LEFT JOIN them as fallbacks for cases where the .emlx is
     # missing or unreadable. parse_emlx remains the primary source.
+    #
+    # We fetch from ALL mailboxes except known noise folders (Spam, Trash,
+    # Deleted Items, Drafts, Outbox) rather than restricting to inbox. This
+    # makes the query uniform across account types: Gmail stores inbox messages
+    # in [Gmail]/All Mail (not a dedicated INBOX folder), and some mail rules
+    # sort messages into custom folders. Our prefilter and LLM handle content-
+    # based triage; the only structural exclusion needed is "clearly not received
+    # mail". Sent mail that slips through will not be classified as actionable.
     try:
         cursor = conn.execute(
             """
@@ -359,11 +442,17 @@ def stream_messages_since(
             LEFT JOIN subjects  s  ON m.subject = s.ROWID
             LEFT JOIN addresses a  ON m.sender  = a.ROWID
             WHERE m.date_received >= ?
-              AND lower(mb.url) LIKE '%/inbox'
+              AND lower(mb.url) NOT LIKE '%spam%'
+              AND lower(mb.url) NOT LIKE '%junk%'
+              AND lower(mb.url) NOT LIKE '%trash%'
+              AND lower(mb.url) NOT LIKE '%deleted%'
+              AND lower(mb.url) NOT LIKE '%draft%'
+              AND lower(mb.url) NOT LIKE '%outbox%'
+              AND lower(mb.url) NOT LIKE '%sent%'
             ORDER BY m.date_received ASC
             LIMIT ?
             """,
-            (since_cd, max_messages),
+            (since_unix, max_messages),
         )
         rows = cursor.fetchall()
     except sqlite3.Error as e:
@@ -400,7 +489,7 @@ def stream_messages_since(
             "sender": sender or "",
             "replyTo": parsed["replyTo"],
             "messageId": parsed["messageId"],
-            "dateReceived": parsed["dateReceived"] or _core_data_to_iso(row["date_received"]),
+            "dateReceived": parsed["dateReceived"] or _unix_to_iso(row["date_received"]),
             "junk": parsed["junk"],
             "read": parsed["read"],
             "headers": parsed["headers"],
@@ -409,11 +498,24 @@ def stream_messages_since(
 
 
 def _parse_mailbox_url(url: Optional[str]) -> tuple[str, str]:
-    """mailbox://<UUID>/<mailbox-path> → (uuid, mailbox-path)."""
+    """<scheme>://<UUID>/<mailbox-path> → (uuid, url-decoded mailbox-path).
+
+    Apple Mail uses different schemes per account type:
+        mailbox:// for IMAP/POP
+        ews://     for Exchange Web Services
+        imap://, pop3:// also seen on some macOS versions
+    The on-disk layout under ~/Library/Mail/V*/<UUID>/ is uniform
+    regardless of scheme, so we strip whatever scheme is present.
+
+    The mailbox path is URL-decoded so callers work with plain names:
+        imap://UUID/%5BGmail%5D/All%20Mail → ("[Gmail]/All Mail")
+        ews://UUID/Inbox                  → ("Inbox")
+    """
     if not url:
         return "", ""
-    path = url.replace("mailbox://", "", 1)
-    parts = path.split("/", 1)
+    after_scheme = url.split("://", 1)
+    body = after_scheme[1] if len(after_scheme) == 2 else after_scheme[0]
+    parts = body.split("/", 1)
     if len(parts) >= 2:
-        return parts[0], parts[1]
+        return parts[0], urllib.parse.unquote(parts[1])
     return parts[0], ""

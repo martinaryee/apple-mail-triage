@@ -119,9 +119,11 @@ def main() -> int:
     ap.add_argument("--truncate-bytes", type=int, default=4096)
     ap.add_argument("--no-classify", action="store_true",
                     help="Skip Ollama classification step")
-    ap.add_argument("--skip-jxa", action="store_true")
+    ap.add_argument("--run-jxa", action="store_true",
+                    help="Also run the legacy JXA fetcher for comparison (~2 min)")
     ap.add_argument("--skip-disk", action="store_true")
     args = ap.parse_args()
+    args.skip_jxa = not args.run_jxa  # JXA is opt-in; disk is default
 
     cfg = _load_config()
     model = cfg.get("ollama_model", "gemma3n:e4b")

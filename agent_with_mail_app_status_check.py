@@ -31,34 +31,36 @@ DEFAULT_MAX_WAIT_MINUTES = 30
 
 
 def is_mail_app_active() -> bool:
-    """Return True if Mail app is running AND has focus."""
-    result = subprocess.run(
+    """Return True if Mail app is running AND is the frontmost app.
+
+    Uses lsappinfo instead of AppleScript so we never touch Mail's event loop
+    during the check — eliminating a source of brief Mail unresponsiveness.
+    """
+    # Quick check: is Mail even running?
+    running = subprocess.run(
         ["pgrep", "-x", "Mail"],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
+    if running.returncode != 0:
         return False
-    
-    # Check if Mail is frontmost (focused)
-    script = '''
-    tell application "System Events"
-        tell process "Mail"
-            get frontmost
-        end tell
-    end tell
-    '''
-    result = subprocess.run(
-        ["osascript"],
-        input=script,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        # If we can't check, assume not active (conservative)
+
+    # lsappinfo front  →  prints the ASN of the frontmost app, e.g. "1:246:"
+    # lsappinfo info -only name <asn>  →  prints  "LSDisplayName"="Mail"
+    try:
+        front = subprocess.run(
+            ["/usr/bin/lsappinfo", "front"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if front.returncode != 0 or not front.stdout.strip():
+            return False
+        info = subprocess.run(
+            ["/usr/bin/lsappinfo", "info", "-only", "name", front.stdout.strip()],
+            capture_output=True, text=True, timeout=2,
+        )
+        return "Mail" in info.stdout
+    except (OSError, subprocess.TimeoutExpired):
         return False
-    
-    return result.stdout.strip().lower() == "true"
 
 
 def acquire_lock(lock_path: Path) -> "io.TextIOWrapper | None":
