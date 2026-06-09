@@ -1,6 +1,6 @@
 # Apple Mail Triage Agent
 
-**WARNING: This code was written as a proof-of-concept experiment to explore the use of local LLMS. Proceed with caution if you let it touch sensitive data!**
+**WARNING: This code was written as a proof-of-concept experiment to explore the use of local LLMs. Proceed with caution if you let it touch sensitive data!**
 
 Triages new Apple Mail messages every 5 minutes using a local LLM. Actionable
 emails are color-flagged in Mail and, optionally, queued as checkboxes in a
