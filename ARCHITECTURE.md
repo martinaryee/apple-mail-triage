@@ -8,7 +8,8 @@ A tour of the code as it stands today. For the user-facing setup guide, see
 `agent.py` is the orchestrator. Every 5 minutes (via launchd) it reads the
 oldest unseen messages since a per-run watermark directly from Apple Mail's
 SQLite Envelope Index and `.emlx` files on disk, drops obvious noise with
-header heuristics, sends survivors to a local Ollama model, and appends
+header heuristics, sends survivors to the on-device Apple Intelligence
+foundation model (FoundationModels framework via apple-fm-sdk), and appends
 actionable items to a markdown file in an Obsidian vault. State (every
 classified message-id) lives in SQLite; the queue file is the user-visible
 source of actionable items. Per-run telemetry goes to NDJSON.
@@ -21,7 +22,7 @@ apple-mail-triage/
 ├── agent_with_mail_app_status_check.py  # launchd entry point; polls lsappinfo before running
 ├── fetcher.py                      # Disk-based message reader (Envelope Index + .emlx)
 ├── prefilter.py                    # Heuristic drops (headers, junk flag)
-├── classify.py                     # Ollama HTTP client + JSON-output parser
+├── classify.py                     # Apple Foundation Models classifier (guided generation)
 ├── triage_queue.py                 # Append-and-dedupe markdown writer
 ├── state.py                        # SQLite cache of (message_id → outcome)
 ├── stats.py                        # RunStats accumulator → runs.ndjson
@@ -74,9 +75,9 @@ sort oldest-first; cap at max_messages_per_run+1 (the +1 detects backlog without
    ↓
 for each message:
    skip if state.is_processed(message_id)
-   prefilter.filter_message(...)        # junk_flag → auto_submitted → precedence_bulk → list_unsubscribe → no_reply_sender
+   prefilter.filter_message(...)        # junk_flag → own_sender → auto_submitted → precedence_bulk → list_unsubscribe → no_reply_sender
    if dropped: state.mark_processed(..., actionable=False); record stat; next
-   classify.classify(...)               # Ollama /api/chat with think=false, no format=json
+   classify.classify(...)               # on-device AFM guided generation (apple-fm-sdk)
    if actionable: triage_queue.append_block(queue_path, entry)
    state.mark_processed(message_id, account, date_received, actionable)
    ↓
@@ -127,6 +128,8 @@ Pure function. Returns `(True, None)` to keep, or `(False, drop_reason)` where
 `drop_reason` is one of:
 
 - `junk_flag` — Apple Mail flagged it
+- `own_sender` — From address is the mailbox owner's own (Sent-equivalent mail
+  that slipped past the folder-based exclusion in `fetcher.py`)
 - `auto_submitted` — `Auto-Submitted: auto-*` header
 - `precedence_bulk` — `Precedence: bulk|list|junk` header
 - `list_unsubscribe` — any `List-Unsubscribe:` header
@@ -134,24 +137,30 @@ Pure function. Returns `(True, None)` to keep, or `(False, drop_reason)` where
 
 Rules are checked in this order; first match wins.
 
-### `classify.classify(msg, model, ...) -> dict`
+### `classify.classify(msg, ...) -> dict`
 
-POSTs to `http://localhost:11434/api/chat`. Returns a dict with
-`actionable, title, reason, urgency, llm_ms, prompt_tokens, eval_tokens, error`.
-Never raises — all HTTP, parse, and validation failures return a default
-`actionable: False, error: <str>` dict.
+Calls the on-device Apple Intelligence foundation model through
+`apple_fm_sdk` (Python bindings for the FoundationModels framework). Returns
+a dict with `actionable, title, reason, urgency, llm_ms, prompt_tokens,
+eval_tokens, error, permanent`. Never raises — all SDK, timeout, and
+validation failures return a default `actionable: False, error: <str>` dict.
 
-Critical Ollama options sent in the request body:
+Key implementation points:
 
-- `"think": False` — disables Gemma 3n's thinking-mode reasoning tokens, which
-  go to `message.thinking` (not `message.content`) and waste 5–8 s per call.
-- `"keep_alive": "30m"` — keeps the model resident across the 5-minute cadence.
-- `"options.num_ctx": 4096` — caps KV cache (default 131072 for Gemma 3n bloats
-  memory without benefit).
-- `"options.num_predict": 200` — bounds output length.
-- **No** `format: "json"` — that mode adds ~1–2 s of grammar overhead; we get
-  equivalent reliability by parsing the first balanced `{...}` from the output
-  via `_extract_json_object()`.
+- **Guided generation** — the `_EmailTriage` `@fm.generable` class constrains
+  output to the exact schema (bool, strings, urgency enum), so there is no
+  JSON extraction or repair step; the SDK returns a typed object.
+- **Fresh session per message** — each email is classified in its own
+  `LanguageModelSession` with the system prompt as instructions; sessions are
+  cheap because the OS manages model residency.
+- **`permanent` error flag** — AFM failures split into deterministic ones
+  (guardrail refusal, unsupported language, content still too large after a
+  1024-byte retry) flagged `permanent: True`, and transient ones (model
+  unavailable, rate limit, timeout) flagged `permanent: False`. `agent.py`
+  marks permanent failures processed and continues; transient failures still
+  halt the run to protect the date watermark.
+- `prompt_tokens`/`eval_tokens` are always 0 — the SDK does not expose token
+  counts; the keys remain for telemetry-schema stability.
 
 ### `triage_queue.append_block(path, entry)` and `existing_message_ids(path)`
 
@@ -219,9 +228,9 @@ cd /Users/martin/projects/apple-mail-triage
 uv run pytest tests/ -q
 ```
 
-95 tests across 6 files. Live tests in `test_classify.py` skip themselves if
-Ollama isn't reachable at `localhost:11434`. Tests use `tmp_path` for
-isolation; no global state.
+105 tests across 7 files. Live tests in `test_classify.py` skip themselves if
+the Apple foundation model is unavailable (Apple Intelligence off or assets
+not downloaded). Tests use `tmp_path` for isolation; no global state.
 
 ## Logging conventions
 

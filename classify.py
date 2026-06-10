@@ -1,20 +1,34 @@
 """
-Ollama-backed email classifier for the mail-to-todo agent.
+Apple Foundation Models email classifier for the mail-to-todo agent.
 
 Given a dict representing a single email message (with keys: subject, sender,
-dateReceived, content, and optionally others), this module POSTs to a local
-Ollama instance and asks a small language model to decide whether the email
-implies a personal action item. The response is validated and returned as a
-structured dict. All errors are caught and returned in-band; this module never
-raises on HTTP or parse failures.
+dateReceived, content, and optionally others), this module asks the on-device
+Apple Intelligence foundation model (via the apple-fm-sdk Python bindings)
+whether the email implies a personal action item. Guided generation guarantees
+a structurally valid response, so there is no JSON extraction or repair here.
+All errors are caught and returned in-band; this module never raises.
+
+Error semantics: results with error != None also carry a `permanent` flag.
+Permanent errors (guardrail refusals, unsupported language, oversized content)
+are deterministic — the same message will fail the same way on every retry —
+so the caller should record them and move on. Transient errors (model
+unavailable, rate limiting, timeouts) should halt the run and be retried on
+the next cycle, matching the agent's watermark-safety behavior.
 """
 
-import json
+import asyncio
 import time
 from pathlib import Path
 from typing import Optional
 
-import requests
+import apple_fm_sdk as fm
+
+# Model identifier recorded in runs.ndjson telemetry.
+MODEL_NAME = "apple-foundation-model"
+
+# CONTENT_TAGGING outperforms the default GENERAL use case for this triage
+# task (higher specificity at comparable sensitivity in benchmarking).
+_MODEL = fm.SystemLanguageModel(use_case=fm.SystemLanguageModelUseCase.CONTENT_TAGGING)
 
 # System prompt is loaded from disk so it can be tuned without touching code.
 # The file lives in `prompts/classify_system.md` next to this module.
@@ -34,41 +48,30 @@ SYSTEM_PROMPT = _load_system_prompt()
 
 _VALID_URGENCY = {"low", "medium", "high"}
 
+# Deterministic failures: retrying the same message yields the same error.
+_PERMANENT_ERRORS = (
+    fm.GuardrailViolationError,
+    fm.RefusalError,
+    fm.UnsupportedLanguageOrLocaleError,
+    fm.DecodingFailureError,
+    fm.InvalidGenerationSchemaError,
+    fm.UnsupportedGuideError,
+)
 
-def _extract_json_object(text: str) -> Optional[str]:
-    """Pull the first balanced { ... } object from `text`, ignoring
-    surrounding markdown fences, prose, or trailing explanation. Returns
-    the JSON substring or None if nothing balanced was found.
 
-    Brace-counting is naive about strings (counts `{`/`}` even inside string
-    literals) but adequate for our small classifier outputs which never
-    contain braces inside string values."""
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            continue
-        if c == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
+@fm.generable
+class _EmailTriage:
+    actionable: bool = fm.guide(
+        "Whether the email implies a personal action the recipient must take"
+    )
+    title: str = fm.guide(
+        "Short imperative todo title under 80 chars; empty string if not actionable"
+    )
+    reason: str = fm.guide("Brief one-sentence justification")
+    urgency: str = fm.guide(
+        "Urgency of the action; low if not actionable",
+        anyOf=["low", "medium", "high"],
+    )
 
 
 def _truncate_content(content: str, max_bytes: int) -> str:
@@ -79,7 +82,7 @@ def _truncate_content(content: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def _default_result(error: Optional[str] = None) -> dict:
+def _default_result(error: Optional[str] = None, permanent: bool = False) -> dict:
     return {
         "actionable": False,
         "title": "",
@@ -89,18 +92,35 @@ def _default_result(error: Optional[str] = None) -> dict:
         "prompt_tokens": 0,
         "eval_tokens": 0,
         "error": error,
+        "permanent": permanent,
     }
+
+
+async def _respond(user_message: str, timeout_s: float) -> _EmailTriage:
+    session = fm.LanguageModelSession(instructions=SYSTEM_PROMPT, model=_MODEL)
+    return await asyncio.wait_for(
+        session.respond(
+            user_message,
+            generating=_EmailTriage,
+            # Greedy (deterministic) decoding: a classification verdict should
+            # not change between runs on identical input. Random sampling
+            # (temperature>0) was producing ±15-30pt swings in benchmark
+            # sensitivity/specificity on the same messages.
+            options=fm.GenerationOptions(
+                sampling=fm.SamplingMode.greedy(), maximum_response_tokens=200
+            ),
+        ),
+        timeout=timeout_s,
+    )
 
 
 def classify(
     msg: dict,
-    model: str = "gemma4:e4b",
-    ollama_url: str = "http://localhost:11434",
     timeout_s: float = 60.0,
     content_truncate_bytes: int = 4096,
 ) -> dict:
     """
-    Classify a single email. Calls Ollama's /api/chat with format='json'.
+    Classify a single email with the on-device Apple foundation model.
 
     Input msg keys (more may be present):
       - subject: str
@@ -113,15 +133,22 @@ def classify(
       - title: str          (short imperative todo title; '' if not actionable)
       - reason: str         (one-line justification)
       - urgency: str        ('low' | 'medium' | 'high'; 'low' if not actionable)
-      - llm_ms: int         (wall-clock ms for the HTTP call)
-      - prompt_tokens: int  (from Ollama 'prompt_eval_count'; 0 if absent)
-      - eval_tokens: int    (from Ollama 'eval_count'; 0 if absent)
-      - error: str | None   (None on success; error message on parse/HTTP failure)
+      - llm_ms: int         (wall-clock ms for the model call)
+      - prompt_tokens: int  (always 0; apple-fm-sdk does not expose token counts)
+      - eval_tokens: int    (always 0; apple-fm-sdk does not expose token counts)
+      - error: str | None   (None on success; error message on failure)
+      - permanent: bool     (True when retrying this message cannot succeed)
 
-    On any failure (HTTP non-2xx, JSON parse failure, timeout), return a
+    On any failure (model unavailable, guardrail refusal, timeout), return a
     dict with actionable=False, error=<str>, and the rest as defaults; do
     NOT raise.
     """
+    available, reason = _MODEL.is_available()
+    if not available:
+        # Unavailability (Apple Intelligence off, model assets still
+        # downloading, battery saver) is transient from the agent's view.
+        return _default_result(error=f"Foundation model unavailable: {reason}")
+
     subject = str(msg.get("subject", ""))
     sender = str(msg.get("sender", ""))
     date_received = str(msg.get("dateReceived", ""))
@@ -136,95 +163,53 @@ def classify(
         f"{truncated_content}"
     )
 
-    payload = {
-        "model": model,
-        "stream": False,
-        # think=false disables reasoning-mode token generation. Gemma 3n's
-        # E4B advertises a "thinking" capability; with thinking on, the
-        # model spends 100+ tokens on internal reasoning that never reaches
-        # message.content, just message.thinking — adding 5-8s of latency
-        # for no benefit on a simple classification task.
-        "think": False,
-        # NOT using format="json" or a JSON schema. Constrained sampling
-        # adds ~1-2s of overhead in Ollama (grammar work outside the
-        # eval_duration timer); we get equivalent reliability by telling
-        # the model in-prompt to emit only a JSON object and parsing the
-        # first balanced { ... } from the response ourselves.
-        # keep_alive 30m comfortably spans the 5-min agent cadence so we
-        # don't pay the ~4s reload penalty every batch and another loaded
-        # model can't evict ours under memory pressure.
-        "keep_alive": "30m",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        # num_ctx caps the KV-cache size. Gemma's default is 131072 tokens;
-        # we never need more than a few thousand for an email + system prompt,
-        # and the larger window slows attention math and bloats memory for no
-        # benefit. num_predict bounds output so a chatty model can't burn time
-        # on a long prose explanation after the JSON object.
-        "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": 200},
-    }
-
     start_ns = time.perf_counter_ns()
     try:
-        response = requests.post(
-            f"{ollama_url}/api/chat",
-            json=payload,
-            timeout=timeout_s,
-        )
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
+        try:
+            parsed = asyncio.run(_respond(user_message, timeout_s))
+        except fm.ExceededContextWindowSizeError:
+            # The on-device model has a small (~4k token) context window.
+            # Retry once with the body cut to 1024 bytes before giving up.
+            user_message = (
+                f"From: {sender}\n"
+                f"Date: {date_received}\n"
+                f"Subject: {subject}\n\n"
+                f"{_truncate_content(content, 1024)}"
+            )
+            parsed = asyncio.run(_respond(user_message, timeout_s))
+    except _PERMANENT_ERRORS as exc:
         elapsed_ms = round((time.perf_counter_ns() - start_ns) / 1_000_000)
-        result = _default_result(error=str(exc))
+        result = _default_result(
+            error=f"{type(exc).__name__}: {exc}", permanent=True
+        )
+        result["llm_ms"] = elapsed_ms
+        return result
+    except fm.ExceededContextWindowSizeError as exc:
+        # Still too large at 1024 bytes — deterministic, do not retry.
+        elapsed_ms = round((time.perf_counter_ns() - start_ns) / 1_000_000)
+        result = _default_result(
+            error=f"{type(exc).__name__}: {exc}", permanent=True
+        )
+        result["llm_ms"] = elapsed_ms
+        return result
+    except Exception as exc:  # noqa: BLE001 — timeouts, rate limits, SDK bugs
+        elapsed_ms = round((time.perf_counter_ns() - start_ns) / 1_000_000)
+        result = _default_result(error=f"{type(exc).__name__}: {exc}")
         result["llm_ms"] = elapsed_ms
         return result
 
     elapsed_ms = round((time.perf_counter_ns() - start_ns) / 1_000_000)
 
-    try:
-        response_json = response.json()
-    except Exception as exc:
-        result = _default_result(error=f"Failed to parse Ollama response as JSON: {exc}")
-        result["llm_ms"] = elapsed_ms
-        return result
+    # Guided generation enforces types and the urgency enum; validation below
+    # is belt-and-suspenders against SDK decoding quirks.
+    actionable = bool(getattr(parsed, "actionable", False))
 
-    prompt_tokens = int(response_json.get("prompt_eval_count", 0))
-    eval_tokens = int(response_json.get("eval_count", 0))
-
-    raw_content = response_json.get("message", {}).get("content", "")
-    json_str = _extract_json_object(raw_content)
-    if json_str is None:
-        result = _default_result(
-            error=f"No JSON object found in LLM output. Raw: {raw_content!r}"
-        )
-        result["llm_ms"] = elapsed_ms
-        result["prompt_tokens"] = prompt_tokens
-        result["eval_tokens"] = eval_tokens
-        return result
-    try:
-        parsed = json.loads(json_str)
-    except json.JSONDecodeError as exc:
-        result = _default_result(
-            error=f"Failed to parse LLM content as JSON: {exc}. Raw: {raw_content!r}"
-        )
-        result["llm_ms"] = elapsed_ms
-        result["prompt_tokens"] = prompt_tokens
-        result["eval_tokens"] = eval_tokens
-        return result
-
-    # Validate and coerce fields
-    actionable = parsed.get("actionable")
-    if not isinstance(actionable, bool):
-        # Try to coerce truthy values
-        actionable = bool(actionable)
-
-    title = str(parsed.get("title", "")).strip()
+    title = str(getattr(parsed, "title", "")).strip()
     title = title[:80]
 
-    reason = str(parsed.get("reason", "")).strip()
+    reason = str(getattr(parsed, "reason", "")).strip()
 
-    urgency = str(parsed.get("urgency", "low")).strip().lower()
+    urgency = str(getattr(parsed, "urgency", "low")).strip().lower()
     if urgency not in _VALID_URGENCY:
         urgency = "low"
 
@@ -239,7 +224,8 @@ def classify(
         "reason": reason,
         "urgency": urgency,
         "llm_ms": elapsed_ms,
-        "prompt_tokens": prompt_tokens,
-        "eval_tokens": eval_tokens,
+        "prompt_tokens": 0,
+        "eval_tokens": 0,
         "error": None,
+        "permanent": False,
     }

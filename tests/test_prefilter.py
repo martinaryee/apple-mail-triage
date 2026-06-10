@@ -75,7 +75,41 @@ class TestJunkFlag:
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 — auto_submitted
+# Rule 2 — own_sender
+# ---------------------------------------------------------------------------
+
+class TestOwnSender:
+    @pytest.mark.parametrize("sender", [
+        "martin.aryee@gmail.com",
+        "Martin Aryee <martin.aryee@gmail.com>",
+        "martin.aryee@ds.dfci.harvard.edu",
+        "Martin Aryee <martin.aryee@ds.dfci.harvard.edu>",
+        "MARTIN.ARYEE@GMAIL.COM",
+    ])
+    def test_own_address_drops(self, sender):
+        msg = _make_msg(sender=sender)
+        keep, reason = filter_message(msg)
+        assert keep is False
+        assert reason == "own_sender"
+
+    def test_other_sender_passes(self):
+        msg = _make_msg(sender="Alice <alice@example.com>")
+        keep, reason = filter_message(msg)
+        assert reason != "own_sender"
+
+    def test_own_sender_wins_over_list_unsubscribe(self):
+        """own_sender is checked before list_unsubscribe."""
+        msg = _make_msg(
+            sender="martin.aryee@gmail.com",
+            headers="List-Unsubscribe: <mailto:unsub@example.com>\r\n",
+        )
+        keep, reason = filter_message(msg)
+        assert keep is False
+        assert reason == "own_sender"
+
+
+# ---------------------------------------------------------------------------
+# Rule 3 — auto_submitted
 # ---------------------------------------------------------------------------
 
 class TestAutoSubmitted:
@@ -122,7 +156,7 @@ class TestAutoSubmitted:
 
 
 # ---------------------------------------------------------------------------
-# Rule 3 — precedence_bulk
+# Rule 4 — precedence_bulk
 # ---------------------------------------------------------------------------
 
 class TestPrecedenceBulk:
@@ -180,7 +214,7 @@ class TestPrecedenceBulk:
 
 
 # ---------------------------------------------------------------------------
-# Rule 4 — list_unsubscribe
+# Rule 5 — list_unsubscribe
 # ---------------------------------------------------------------------------
 
 class TestListUnsubscribe:
@@ -212,7 +246,7 @@ class TestListUnsubscribe:
 
 
 # ---------------------------------------------------------------------------
-# Rule 5 — no_reply_sender
+# Rule 6 — no_reply_sender
 # ---------------------------------------------------------------------------
 
 class TestNoReplySender:

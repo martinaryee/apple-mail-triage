@@ -18,7 +18,8 @@ The agent wakes up every 5 minutes, checks whether Mail is the frontmost app
    `.emlx` files on disk — no AppleScript, no Mail event-loop involvement.
 2. Drops obvious noise (newsletters, auto-replies, mailing lists, junk) with a
    fast header heuristic — no LLM needed.
-3. Sends the survivors to a local Ollama model for classification.
+3. Sends the survivors to the on-device Apple Intelligence foundation model
+   (FoundationModels framework via `apple-fm-sdk`) for classification.
 4. Color-flags every processed message in Apple Mail (red/orange/yellow =
    actionable by urgency, grey = not actionable).
 5. Optionally appends actionable emails as `- [ ]` checkboxes to `Mail
@@ -50,7 +51,7 @@ launchd (every 5 min)
   prefilter.py   (headers + junk flag, no LLM)
         |
         v
-  classify.py    (Ollama gemma4:e4b, think=false)
+  classify.py    (on-device Apple foundation model, guided generation)
         |
    actionable?
       yes |                        no |
@@ -73,23 +74,26 @@ After every run, each processed message is color-flagged in Apple Mail:
 
 | Color | Flag index | Meaning |
 |-------|-----------|---------|
-| 🔴 Red | 0 | Actionable — high urgency |
-| 🟠 Orange | 1 | Actionable — medium urgency |
-| 🟡 Yellow | 2 | Actionable — low urgency |
-| ⚫ Grey | 6 | Seen, no action needed |
+| 🔴 Red | 1 | Actionable — high urgency |
+| 🟠 Orange | 2 | Actionable — medium urgency |
+| 🟡 Yellow | 3 | Actionable — low urgency |
 
-Flag indices were determined empirically and differ from Apple's documentation.
+Non-actionable messages are left unflagged. Flag index 0 = no flag in Apple Mail.
 
 ---
 
 ## Requirements
 
-- macOS 14 or later, with Apple Mail configured with at least one account
-- Apple Silicon recommended — Ollama inference is significantly faster on M-series chips
-- [Homebrew](https://brew.sh) installed, with `uv` and `ollama` available:
+- macOS 26 (Tahoe) or later on Apple Silicon, with Apple Mail configured with
+  at least one account
+- **Apple Intelligence enabled** (System Settings → Apple Intelligence & Siri)
+  with the on-device model downloaded — classification uses the system
+  foundation model via the FoundationModels framework
+- Full Xcode 26+ with the license accepted (`sudo xcodebuild -license accept`)
+  — needed once to build the `apple-fm-sdk` Python bindings from source
+- [Homebrew](https://brew.sh) installed, with `uv` available:
   ```bash
   brew install uv
-  brew install ollama
   ```
 - An Obsidian vault, or any directory you want a markdown file dropped into
 
@@ -104,8 +108,8 @@ cd /Users/martin/projects/apple-mail-triage
 
 The install script runs in two steps:
 
-1. **First run**: creates `~/.apple-mail-triage/` and its subdirectories, pulls
-   `gemma4:e4b` via Ollama if it isn't already on disk (~10 GB), and writes a
+1. **First run**: creates `~/.apple-mail-triage/` and its subdirectories,
+   verifies the on-device Apple foundation model is available, and writes a
    starter config to `~/.apple-mail-triage/config.toml`.
 
 2. **Edit the config**: open `~/.apple-mail-triage/config.toml` and set at least
@@ -161,7 +165,6 @@ Config file: `~/.apple-mail-triage/config.toml`. A fully-commented example is at
 | `enable_triage_queue` | `true` | Write actionable items to a markdown queue file. Set to `false` for flagging-only mode — no Obsidian required. |
 | `vault_path` | — | Absolute path to your Obsidian vault root (or any directory). **Required when `enable_triage_queue = true`.** |
 | `queue_file` | `"Inbox/Mail Triage.md"` | Path *within* the vault for the review queue. Created on first write. Ignored when queue is disabled. |
-| `ollama_model` | `"gemma4:e4b"` | Model used for classification. Must be pulled locally (`ollama pull <model>`). |
 | `poll_interval_minutes` | `5` | Informational — reflects the `StartInterval` in the plist. Change in the plist, not just here. |
 | `max_messages_per_run` | `50` | Cap on messages classified per run. Excess is carried to the next run. |
 | `content_truncate_bytes` | `4096` | Message body trimmed to this length before sending to the LLM. |
@@ -238,7 +241,7 @@ Regardless of queue settings, every processed message is color-flagged:
 | 🔴 Red | Actionable — high urgency |
 | 🟠 Orange | Actionable — medium urgency |
 | 🟡 Yellow | Actionable — low urgency |
-| ⚫ Grey | Seen, no action needed |
+| (no flag) | Not actionable — untouched |
 
 ### Where action items appear (queue enabled)
 
@@ -347,12 +350,17 @@ Access](#full-disk-access) above. For manual runs, the terminal app needs FDA.
 `set_flags.js` uses JXA to talk to Mail. Grant **osascript → Mail** in System
 Settings → Privacy & Security → Automation.
 
-### "Ollama errors" / classifier not responding
+### "Foundation model unavailable" / classifier not responding
 
 ```bash
-curl -s localhost:11434/api/tags   # should return model list JSON
-ollama serve &                     # if it fails, start Ollama
+uv run python -c "import apple_fm_sdk as fm; print(fm.SystemLanguageModel().is_available())"
 ```
+
+If this prints `(False, <reason>)`, the usual causes are Apple Intelligence
+being turned off (System Settings → Apple Intelligence & Siri), the model
+assets still downloading, or low-power/battery-saver restrictions. Guardrail
+refusals on individual messages are logged as `classify permanent error` in
+`agent.log` and skipped — they do not stop the run.
 
 ### "Hitting the cap"
 
@@ -380,7 +388,7 @@ Each run appends one JSON record to `~/.apple-mail-triage/logs/runs.ndjson`. Exa
   "started_at": "2026-05-03T15:30:00.123Z",
   "ended_at": "2026-05-03T15:30:18.901Z",
   "duration_ms": 18778,
-  "model": "gemma4:e4b",
+  "model": "apple-foundation-model",
   "cap_hit": false,
   "max_messages_per_run": 50,
   "counts": {
@@ -425,7 +433,9 @@ df = pd.read_json("~/.apple-mail-triage/logs/runs.ndjson", lines=True)
 
 ## Privacy guarantee
 
-- The only network call the agent ever makes is to `localhost:11434` (Ollama).
+- The agent makes no network calls at all: classification runs on-device
+  through the FoundationModels framework (Apple's system foundation model),
+  which processes prompts locally.
 - You can verify this while a run is in flight:
   ```bash
   lsof -i -P | grep agent.py

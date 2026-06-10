@@ -18,17 +18,18 @@ start_date = "2026-05-03"
 enable_triage_queue = true
 
 # Obsidian vault root (required when enable_triage_queue = true).
-# Personal: "/Users/martin/Dropbox (Personal)/Obsidian - Personal"
-# Work:     "/Users/martin/Partners HealthCare Dropbox/Martin Aryee/Obsidian - Work"
-vault_path = "/Users/martin/Dropbox (Personal)/Obsidian - Personal"
+# Merged vault:
+vault_path = "/Users/martin/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian"
 
 # Path *within* the vault for the review queue. Created on first write.
 queue_file = "Inbox/Mail Triage.md"
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
-# Local Ollama model used for classification.
-ollama_model = "gemma4:e4b"
+# Classification uses the on-device Apple Intelligence foundation model
+# (FoundationModels framework via apple-fm-sdk). There is no model setting:
+# the system model is the only option, and Apple Intelligence must be
+# enabled in System Settings for it to be available.
 
 # ── Scheduling ────────────────────────────────────────────────────────────────
 

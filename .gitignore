@@ -6,7 +6,12 @@ __pycache__/
 .DS_Store
 
 # Local state and logs (never committed)
-.mail-agent/
+.apple-mail-triage/
+
+# Benchmark cache & exports — contain real email bodies, never commit
+benchmark_cache.json
+benchmark_100.csv
+rebenchmark_tuned_prompt.json
 
 # Editor
 .vscode/

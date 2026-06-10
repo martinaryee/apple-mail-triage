@@ -17,6 +17,7 @@ import tomllib
 import time
 from pathlib import Path
 
+from classify import MODEL_NAME
 from stats import RunStats
 
 # Paths
@@ -221,7 +222,7 @@ def main() -> int:
     
     if waited_seconds > 0:
         runs_path = DEFAULT_LOG_DIR / "runs.ndjson"
-        model = cfg["ollama_model"]
+        model = MODEL_NAME
         cap = int(cfg["max_messages_per_run"])
         
         stats = RunStats(

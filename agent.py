@@ -3,7 +3,7 @@
 
 Pipeline per run: read new messages from Apple Mail's Envelope Index + .emlx
 files (fetcher.py, no AppleScript) -> prefilter heuristics -> classify with
-local Ollama -> optionally append actionable items to a markdown review queue
+the on-device Apple foundation model -> optionally append actionable items to a markdown review queue
 -> record outcome in SQLite cache and runs.ndjson -> color-flag in Mail (JXA).
 
 Queue writing is optional (enable_triage_queue = false in config). When
@@ -38,10 +38,9 @@ DEFAULT_LOG_DIR = Path.home() / ".apple-mail-triage" / "logs"
 DEFAULT_LOCK_PATH = Path.home() / ".apple-mail-triage" / "agent.lock"
 JXA_SET_FLAGS  = Path(__file__).resolve().parent / "jxa" / "set_flags.js"
 
-_FLAG_GRAY   = 6  # processed, no action needed (grey — works on Gmail + Exchange)
-_FLAG_YELLOW = 2  # low urgency actionable
-_FLAG_ORANGE = 1  # medium urgency actionable
-_FLAG_RED    = 0  # high urgency actionable
+_FLAG_YELLOW = 3  # low urgency actionable
+_FLAG_ORANGE = 2  # medium urgency actionable
+_FLAG_RED    = 1  # high urgency actionable  (0 = no flag in Apple Mail; never use 0)
 _URGENCY_TO_FLAG = {"high": _FLAG_RED, "medium": _FLAG_ORANGE, "low": _FLAG_YELLOW}
 
 
@@ -194,7 +193,7 @@ def main() -> int:
             log.info("another run is active — skipping")
             return 0
 
-    model = cfg["ollama_model"]
+    model = classify_mod.MODEL_NAME
     cap = int(cfg["max_messages_per_run"])
     truncate = int(cfg["content_truncate_bytes"])
     start_date = str(cfg["start_date"])
@@ -277,7 +276,6 @@ def main() -> int:
             if not keep:
                 stats.record_heuristic_dropped(drop_reason or "unknown")
                 vprint(n, f"DROP {drop_reason}", f"{sender} | {subject}")
-                _flag(msg, _FLAG_GRAY)
                 if not args.dry_run:
                     state.mark_processed(mid, account, msg.get("dateReceived", ""), False)
                 continue
@@ -285,7 +283,7 @@ def main() -> int:
             vprint(n, "CLASSIFYING...", f"{sender} | {subject}")
             try:
                 result = classify_mod.classify(
-                    msg, model=model, content_truncate_bytes=truncate,
+                    msg, content_truncate_bytes=truncate,
                 )
             except Exception as e:  # noqa: BLE001
                 stats.record_error("classify", mid, str(e))
@@ -295,7 +293,30 @@ def main() -> int:
 
             if result.get("error"):
                 stats.record_error("classify", mid, result["error"])
+                if result.get("permanent"):
+                    # Deterministic failure (e.g. AFM guardrail refusal):
+                    # retrying this message can never succeed, and halting
+                    # here would wedge the agent on it forever. Record the
+                    # error, treat as not actionable, and mark processed so
+                    # the watermark can advance past it.
+                    log.warning(
+                        "classify permanent error for %s (skipping): %s",
+                        mid, result["error"],
+                    )
+                    vprint(n, "ERROR classify-permanent", f"{sender} | {subject}")
+                    if not args.dry_run:
+                        state.mark_processed(
+                            mid, account, msg.get("dateReceived", ""), False
+                        )
+                    continue
                 log.warning("classify error for %s: %s", mid, result["error"])
+                vprint(n, "ERROR classify", f"{sender} | {subject}")
+                # Do not mark this message processed. Also stop this run rather
+                # than continuing to later messages: the agent uses a global
+                # date watermark based on processed rows, so processing newer
+                # mail after a transient classifier failure could advance the
+                # watermark past this failed message and prevent a later retry.
+                break
 
             actionable = bool(result.get("actionable", False))
             urgency = result.get("urgency", "low")
@@ -343,7 +364,6 @@ def main() -> int:
                         urgency, date_received, account, title,
                     )
             else:
-                _flag(msg, _FLAG_GRAY)
                 vprint(n, "not actionable", f"{sender} | {subject}")
 
             if not args.dry_run:

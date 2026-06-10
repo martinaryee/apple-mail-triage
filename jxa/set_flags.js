@@ -9,8 +9,8 @@
  * CLI:
  *   --input <path>   REQUIRED. Path to a JSON file containing an array of:
  *                    { account, mailbox, id, flagIndex }
- *                    where flagIndex is 0–6 (or -1 to clear):
- *                    0=red  1=orange  2=yellow  3=green  4=blue  5=purple  6=grey
+ *                    where flagIndex is 1–6 (0 = no flag / clears; never pass 0):
+ *                    1=red  2=orange  3=yellow  4=green  5=blue  6=grey
  *
  * Exit 0 on success (partial failures are logged to stderr but not fatal).
  * Exit 1 on argument or I/O errors.
@@ -71,11 +71,10 @@ function run(argv) {
         continue;
       }
       var msg = matches[0];
-      // Setting flagIndex directly is sufficient — a non-zero value marks the
-      // message as flagged with that color; zero clears the flag. Avoid setting
-      // flaggedStatus first: doing so triggers an IMAP sync which appears to
-      // put the message in a transitional state that causes the subsequent
-      // flagIndex assignment to throw "AppleEvent handler failed".
+      // Setting flagIndex directly is sufficient. Avoid setting flaggedStatus
+      // first: doing so triggers an IMAP sync which appears to put the message
+      // in a transitional state that causes the subsequent flagIndex assignment
+      // to throw "AppleEvent handler failed".
       msg.flagIndex = a.flagIndex;
       ok++;
       // Yield 1 s between messages so Mail's event loop can breathe and

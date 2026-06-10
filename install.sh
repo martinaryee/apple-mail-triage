@@ -48,26 +48,29 @@ if ! command -v uv &>/dev/null; then
     exit 1
 fi
 
-if ! command -v ollama &>/dev/null; then
+echo "[2/8] Dependencies: uv found"
+
+# ----------------------------------------------------------
+# 3. Check the on-device Apple foundation model is available
+# ----------------------------------------------------------
+echo "[3/8] Checking Apple Intelligence foundation model availability ..."
+if ! uv run --project "${PROJECT_DIR}" python - <<'PY'
+import sys
+import apple_fm_sdk as fm
+ok, reason = fm.SystemLanguageModel().is_available()
+if not ok:
+    print(f"      Foundation model unavailable: {reason}", file=sys.stderr)
+    sys.exit(1)
+PY
+then
     echo ""
-    echo "ERROR: 'ollama' not found on PATH." >&2
-    echo "       Install it from https://ollama.com and start it, then re-run this script." >&2
+    echo "ERROR: the on-device Apple foundation model is not available." >&2
+    echo "       Enable Apple Intelligence in System Settings > Apple Intelligence & Siri," >&2
+    echo "       wait for the model download to finish, then re-run this script." >&2
+    echo "       (Building apple-fm-sdk also requires full Xcode with an accepted license.)" >&2
     exit 1
 fi
-
-echo "[2/8] Dependencies: uv and ollama found"
-
-# ----------------------------------------------------------
-# 3. Ensure gemma4:e4b is pulled
-# ----------------------------------------------------------
-echo "[3/8] Checking Ollama model gemma4:e4b ..."
-if ! ollama list 2>/dev/null | grep -q "gemma4:e4b"; then
-    echo "      Model gemma4:e4b not found locally — pulling now (this may take a few minutes)..."
-    ollama pull gemma4:e4b
-    echo "      Pull complete."
-else
-    echo "      Model gemma4:e4b already present."
-fi
+echo "      Foundation model available."
 
 # ----------------------------------------------------------
 # 4. Create ~/.apple-mail-triage/logs/ if missing
@@ -94,7 +97,6 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "        - vault_path  : path to your Obsidian vault"
     echo "        - queue_file  : relative path within the vault"
     echo "        - start_date  : earliest date the agent should look back to"
-    echo "        - ollama_model: model name (default: gemma4:e4b)"
     echo ""
     echo "      Once you are happy with the config, re-run this script:"
     echo "        bash ${PROJECT_DIR}/install.sh"

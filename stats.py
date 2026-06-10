@@ -29,6 +29,7 @@ _HEURISTIC_REASONS = (
     "junk_flag",
     "auto_submitted",
     "precedence_bulk",
+    "own_sender",
 )
 
 _URGENCIES = ("low", "medium", "high")

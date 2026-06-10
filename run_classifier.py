@@ -14,20 +14,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tomllib
 from pathlib import Path
 
 import classify as classify_mod
 
 CANDIDATES_PATH = Path.home() / ".apple-mail-triage" / "candidates.json"
-CONFIG_PATH = Path.home() / ".apple-mail-triage" / "config.toml"
-
-
-def _load_model() -> str:
-    if CONFIG_PATH.exists():
-        with CONFIG_PATH.open("rb") as f:
-            return tomllib.load(f).get("ollama_model", "gemma4:e4b")
-    return "gemma4:e4b"
 
 
 def main() -> int:
@@ -39,11 +30,6 @@ def main() -> int:
         type=Path,
         default=CANDIDATES_PATH,
         help=f"Path to candidates JSON (default: {CANDIDATES_PATH})",
-    )
-    ap.add_argument(
-        "--model",
-        default=None,
-        help="Ollama model override (default: read from config.toml)",
     )
     ap.add_argument(
         "--truncate-bytes",
@@ -64,7 +50,7 @@ def main() -> int:
     if not candidates:
         sys.exit("No candidates in file — nothing to classify.")
 
-    model = args.model or _load_model()
+    model = classify_mod.MODEL_NAME
     total = len(candidates)
 
     print(f"Model:  {model}")
@@ -82,7 +68,6 @@ def main() -> int:
 
         result = classify_mod.classify(
             msg,
-            model=model,
             content_truncate_bytes=args.truncate_bytes,
         )
 

@@ -28,7 +28,7 @@ _COUNTS_KEYS = {
 
 _HEURISTIC_KEYS = {
     "list_unsubscribe", "no_reply_sender", "junk_flag",
-    "auto_submitted", "precedence_bulk",
+    "auto_submitted", "precedence_bulk", "own_sender",
 }
 
 

@@ -43,6 +43,16 @@ _NOREPLY_PREFIX_RE = re.compile(
 #   "alice@x.com"          ->  "alice@x.com"  (fallback)
 _ANGLE_BRACKET_RE = re.compile(r"<([^>]+@[^>]+)>")
 
+# Mailbox owner's own addresses. Mail sent FROM these addresses is the
+# owner's own outgoing mail (Sent-equivalent), which is never actionable for
+# the owner as a *recipient* of this triage.
+_OWN_ADDRESSES: frozenset[str] = frozenset(
+    {
+        "martin.aryee@gmail.com",
+        "martin.aryee@ds.dfci.harvard.edu",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -126,32 +136,37 @@ def filter_message(msg: dict) -> tuple[bool, Optional[str]]:
     Returns ``(keep, drop_reason)``:
       keep == True  → proceed to LLM; drop_reason is None.
       keep == False → skip; drop_reason is one of:
-        "junk_flag", "auto_submitted", "precedence_bulk",
+        "junk_flag", "own_sender", "auto_submitted", "precedence_bulk",
         "list_unsubscribe", "no_reply_sender".
     """
     # --- Rule 1: junk flag --------------------------------------------------
     if msg.get("junk") is True:
         return False, "junk_flag"
 
+    email_addr = _extract_email(msg.get("sender", ""))
+
+    # --- Rule 2: own sender (Sent-equivalent mail) --------------------------
+    if email_addr.lower() in _OWN_ADDRESSES:
+        return False, "own_sender"
+
     # Parse headers once; used by the remaining rules.
     parsed = _parse_headers(msg.get("headers", ""))
 
-    # --- Rule 2: Auto-Submitted ---------------------------------------------
+    # --- Rule 3: Auto-Submitted ---------------------------------------------
     auto_sub = parsed.get("auto-submitted", "")
     if auto_sub.lower().startswith("auto-"):
         return False, "auto_submitted"
 
-    # --- Rule 3: Precedence: bulk | list | junk -----------------------------
+    # --- Rule 4: Precedence: bulk | list | junk -----------------------------
     precedence = parsed.get("precedence", "")
     if re.match(r"^(bulk|list|junk)$", precedence.strip(), re.IGNORECASE):
         return False, "precedence_bulk"
 
-    # --- Rule 4: List-Unsubscribe -------------------------------------------
+    # --- Rule 5: List-Unsubscribe -------------------------------------------
     if "list-unsubscribe" in parsed:
         return False, "list_unsubscribe"
 
-    # --- Rule 5: no-reply sender --------------------------------------------
-    email_addr = _extract_email(msg.get("sender", ""))
+    # --- Rule 6: no-reply sender --------------------------------------------
     if "@" in email_addr:
         local_part = email_addr.split("@", 1)[0]
         if _is_noreply_local_part(local_part):

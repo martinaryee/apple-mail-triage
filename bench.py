@@ -38,7 +38,7 @@ def _load_config():
     if DEFAULT_CONFIG_PATH.exists():
         with DEFAULT_CONFIG_PATH.open("rb") as f:
             return tomllib.load(f)
-    return {"ollama_model": "gemma3n:e4b", "content_truncate_bytes": 4096}
+    return {"content_truncate_bytes": 4096}
 
 
 def _fetch_jxa(since: str, max_n: int, truncate: int) -> tuple[float, list[dict], list[str]]:
@@ -86,12 +86,12 @@ def _time_prefilter(messages: list[dict]) -> list[float]:
     return times
 
 
-def _time_classify(messages: list[dict], model: str, truncate: int) -> list[tuple[float, dict]]:
+def _time_classify(messages: list[dict], truncate: int) -> list[tuple[float, dict]]:
     """Returns [(wall_seconds, classify_result), ...] for each message."""
     out = []
     for m in messages:
         t0 = time.perf_counter()
-        result = classify_mod.classify(m, model=model, content_truncate_bytes=truncate)
+        result = classify_mod.classify(m, content_truncate_bytes=truncate)
         out.append((time.perf_counter() - t0, result))
     return out
 
@@ -118,7 +118,7 @@ def main() -> int:
     ap.add_argument("--max", type=int, default=50)
     ap.add_argument("--truncate-bytes", type=int, default=4096)
     ap.add_argument("--no-classify", action="store_true",
-                    help="Skip Ollama classification step")
+                    help="Skip LLM classification step")
     ap.add_argument("--run-jxa", action="store_true",
                     help="Also run the legacy JXA fetcher for comparison (~2 min)")
     ap.add_argument("--skip-disk", action="store_true")
@@ -126,7 +126,7 @@ def main() -> int:
     args.skip_jxa = not args.run_jxa  # JXA is opt-in; disk is default
 
     cfg = _load_config()
-    model = cfg.get("ollama_model", "gemma3n:e4b")
+    model = classify_mod.MODEL_NAME
     truncate = args.truncate_bytes or int(cfg.get("content_truncate_bytes", 4096))
 
     print(f"Benchmark — since={args.since}  max={args.max}  truncate={truncate}B  model={model}")
@@ -177,7 +177,7 @@ def main() -> int:
         # Only classify messages the prefilter would keep — matches agent.py.
         kept = [m for m in sample if filter_message(m)[0]]
         print(f"  (kept after prefilter: {len(kept)} of {len(sample)})")
-        cls_times = [t for t, _ in _time_classify(kept, model, truncate)]
+        cls_times = [t for t, _ in _time_classify(kept, truncate)]
         print(_summary("classify", cls_times))
 
     return 0

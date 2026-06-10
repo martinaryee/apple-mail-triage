@@ -1,16 +1,22 @@
-"""Tests for classify.py — covers live Ollama calls, failure paths, and truncation."""
+"""Tests for classify.py — covers live AFM calls, failure paths, and truncation."""
 
 import pytest
-import requests
 
+import classify as classify_mod
 from classify import classify, _truncate_content
 
+RESULT_KEYS = (
+    "actionable", "title", "reason", "urgency",
+    "llm_ms", "prompt_tokens", "eval_tokens", "error", "permanent",
+)
 
-def _ollama_available() -> bool:
-    """Return True if Ollama is reachable at localhost:11434."""
+
+def _afm_available() -> bool:
+    """Return True if the on-device Apple foundation model is usable."""
     try:
-        requests.get("http://localhost:11434/api/tags", timeout=2)
-        return True
+        import apple_fm_sdk as fm
+        ok, _ = fm.SystemLanguageModel().is_available()
+        return ok
     except Exception:
         return False
 
@@ -36,32 +42,50 @@ NOT_ACTIONABLE_MSG = {
 }
 
 
-@pytest.mark.skipif(not _ollama_available(), reason="Ollama not reachable at localhost:11434")
+@pytest.mark.skipif(not _afm_available(), reason="Apple foundation model not available")
 def test_classify_live_actionable():
     result = classify(ACTIONABLE_MSG)
     assert result["actionable"] is True, f"Expected actionable=True, got: {result}"
     assert result["title"] != "", f"Expected non-empty title, got: {result}"
     assert result["error"] is None, f"Expected no error, got: {result['error']}"
     assert result["llm_ms"] > 0, f"Expected llm_ms > 0, got: {result['llm_ms']}"
-    assert result["prompt_tokens"] > 0, f"Expected prompt_tokens > 0, got: {result['prompt_tokens']}"
 
 
-@pytest.mark.skipif(not _ollama_available(), reason="Ollama not reachable at localhost:11434")
+@pytest.mark.skipif(not _afm_available(), reason="Apple foundation model not available")
 def test_classify_live_not_actionable():
     result = classify(NOT_ACTIONABLE_MSG)
     assert result["actionable"] is False, f"Expected actionable=False, got: {result}"
     assert result["error"] is None, f"Expected no error, got: {result['error']}"
 
 
-def test_classify_handles_bad_url():
-    """Passing an unreachable URL must return a safe default dict, not raise."""
-    result = classify(ACTIONABLE_MSG, ollama_url="http://localhost:1")
+def test_classify_transient_failure_returns_safe_default(monkeypatch):
+    """A transient failure (e.g. timeout) must return error with permanent=False."""
+
+    async def boom(user_message, timeout_s):
+        raise TimeoutError("model call timed out")
+
+    monkeypatch.setattr(classify_mod, "_respond", boom)
+    result = classify(ACTIONABLE_MSG)
     assert result["actionable"] is False
     assert result["error"] is not None
-    assert isinstance(result["error"], str)
-    assert len(result["error"]) > 0
-    # Verify all expected keys are present
-    for key in ("actionable", "title", "reason", "urgency", "llm_ms", "prompt_tokens", "eval_tokens", "error"):
+    assert result["permanent"] is False
+    for key in RESULT_KEYS:
+        assert key in result, f"Missing key '{key}' in result"
+
+
+def test_classify_guardrail_failure_is_permanent(monkeypatch):
+    """Guardrail refusals are deterministic; the result must say permanent=True."""
+    import apple_fm_sdk as fm
+
+    async def refuse(user_message, timeout_s):
+        raise fm.GuardrailViolationError("content flagged")
+
+    monkeypatch.setattr(classify_mod, "_respond", refuse)
+    result = classify(ACTIONABLE_MSG)
+    assert result["actionable"] is False
+    assert result["error"] is not None
+    assert result["permanent"] is True
+    for key in RESULT_KEYS:
         assert key in result, f"Missing key '{key}' in result"
 
 
