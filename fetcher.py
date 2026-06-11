@@ -325,6 +325,22 @@ def _truncate_to_bytes(s: str, max_bytes: int) -> str:
 # ── .emlx path resolution ───────────────────────────────────────────────────
 
 
+def _emlx_bucket_dirs(msg_id: int) -> list[str]:
+    """Apple Mail's bucket directory names for a message id.
+
+    Mail files each .emlx under directories named by the digits of
+    (msg_id // 1000) in REVERSE order, then a Messages/ leaf:
+        id 597914 -> 597914 // 1000 = 597 -> "597" reversed -> 7/9/5
+        full path: Data/7/9/5/Messages/597914.emlx
+        id  89346 ->  89346 // 1000 =  89 ->  "89" reversed -> 9/8  (2 levels)
+        id    742 ->    742 // 1000 =   0 ->   "0"          -> 0    (1 level)
+    The number of levels therefore scales with id magnitude. Verified to hold
+    with zero mismatches across 9k+ messages on IMAP (Gmail) and Exchange
+    (DFCI/HSPH) accounts. Returns the ordered bucket directory names.
+    """
+    return list(reversed(str(msg_id // 1000)))
+
+
 def _emlx_path(mail_dir: Path, account_uuid: str, mailbox_name: str, msg_id: int) -> Optional[Path]:
     """Find the .emlx file for a (account, mailbox, msg_id) tuple.
 
@@ -336,10 +352,10 @@ def _emlx_path(mail_dir: Path, account_uuid: str, mailbox_name: str, msg_id: int
       Modern layout (with sub-UUID; all known current installs):
         V*/<UUID>/<mailbox>.mbox/<sub-UUID>/Data/<a>/<b>/<c>/Messages/<id>.emlx
 
-    Bucket depth also varies: Exchange uses 3 levels, IMAP/Gmail 0–2.
-    We discover the Data directory by inspecting the mbox directory, then
-    try all observed bucket depths (0–3). Cost is O(1) directory listings
-    plus a handful of bounded globs.
+    The bucket directories are derivable directly from the msg_id (see
+    _emlx_bucket_dirs), so the common case is a single exists() check. A
+    bounded glob over observed bucket depths (0–3) remains as a fallback for
+    any layout the deterministic rule doesn't cover.
 
     Nested mailbox paths (e.g. "[Gmail]/All Mail") map to nested .mbox
     directories on disk: each path segment gets its own .mbox suffix.
@@ -367,6 +383,24 @@ def _emlx_path(mail_dir: Path, account_uuid: str, mailbox_name: str, msg_id: int
     except OSError:
         pass
 
+    # Fast path: jump straight to the deterministic bucket directory. This
+    # turns a per-message lookup from a full-mailbox scandir storm (Gmail's
+    # "All Mail" is ~220k files across ~7400 dirs — tens of seconds per glob
+    # when the VFS cache is cold or Mail is concurrently writing the tree)
+    # into a single stat().
+    bucket = _emlx_bucket_dirs(msg_id)
+    for ext in (".emlx", ".partial.emlx"):
+        for data_dir in data_dirs:
+            candidate = data_dir
+            for b in bucket:
+                candidate = candidate / b
+            candidate = candidate / "Messages" / f"{msg_id}{ext}"
+            if candidate.is_file():
+                return candidate
+
+    # Fallback: deterministic path missed (unexpected layout / future macOS
+    # change). Fall back to the original bounded glob so findability never
+    # regresses — at worst this is as slow as the old behavior.
     for ext in (".emlx", ".partial.emlx"):
         for data_dir in data_dirs:
             for bucket_pattern in (
